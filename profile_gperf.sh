@@ -63,6 +63,7 @@ cd "$SCRIPT_DIR"
 
 PROFILE_BINARY="main_gperf"
 PROFILE_DATA="main.prof"
+PERF_REPORT="perf_report.txt"
 
 # Verify input file exists
 if [ ! -f "$INPUT_FILE" ]; then
@@ -75,6 +76,12 @@ if ! pkg-config --exists libprofiler 2>/dev/null; then
     echo "Error: gperftools (libprofiler) not found"
     echo "Install with: sudo apt-get install google-perftools libgoogle-perftools-dev"
     exit 1
+fi
+
+# Check if perf is available (optional, for cache/page fault analysis)
+PERF_AVAILABLE=false
+if command -v perf &> /dev/null; then
+    PERF_AVAILABLE=true
 fi
 
 GPERF_CFLAGS=$(pkg-config --cflags libprofiler)
@@ -104,6 +111,9 @@ echo ""
 
 echo "=== Running with CPU Profiling ==="
 echo "Profile data will be written to: $PROFILE_DATA"
+if [ "$PERF_AVAILABLE" = true ]; then
+    echo "Cache/page fault metrics will be written to: $PERF_REPORT"
+fi
 echo ""
 
 # Run with CPU profiling enabled
@@ -119,7 +129,20 @@ CMD=("./$PROFILE_BINARY" --input "$INPUT_FILE")
 [ -n "$NUM_THREADS" ] && CMD+=(--threads "$NUM_THREADS")
 
 echo "Running: ${CMD[@]}"
-"${CMD[@]}"
+if [ "$PERF_AVAILABLE" = true ]; then
+    echo ""
+    perf stat \
+        -e page-faults,minor-faults,major-faults \
+        -e L1-dcache-loads,L1-dcache-load-misses \
+        -e LLC-loads,LLC-load-misses \
+        -e dTLB-loads,dTLB-load-misses \
+        -e branch-instructions,branch-misses \
+        -e cycles,instructions \
+        -o "$PERF_REPORT" \
+        "${CMD[@]}"
+else
+    "${CMD[@]}"
+fi
 
 unset CPUPROFILE
 unset CPUPROFILE_FREQUENCY
@@ -127,6 +150,55 @@ unset CPUPROFILE_FREQUENCY
 echo ""
 echo "✓ Profiling complete"
 echo ""
+
+# Display perf report if available
+if [ "$PERF_AVAILABLE" = true ] && [ -f "$PERF_REPORT" ]; then
+    echo "=== Cache & Memory Performance Report ==="
+    echo ""
+    cat "$PERF_REPORT"
+
+    # Calculate and display derived metrics
+    echo ""
+    echo "=== Derived Metrics ==="
+    echo ""
+
+    L1_MISS_RATE=$(grep "L1-dcache-load-misses" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    L1_LOADS=$(grep "L1-dcache-loads" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    LLC_MISS_RATE=$(grep "LLC-load-misses" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    LLC_LOADS=$(grep "LLC-loads" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    PAGE_FAULTS=$(grep " page-faults" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    MAJOR_FAULTS=$(grep " major-faults" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    MINOR_FAULTS=$(grep " minor-faults" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    BRANCH_MISSES=$(grep " branch-misses" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    BRANCH_INSTRUCTIONS=$(grep " branch-instructions" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    INSTRUCTIONS=$(grep " instructions" "$PERF_REPORT" | tail -1 | awk '{print $1}' | tr -d ',')
+    CYCLES=$(grep " cycles" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+
+    [ -n "$PAGE_FAULTS" ] && echo "Total page faults:       $PAGE_FAULTS"
+    [ -n "$MAJOR_FAULTS" ] && echo "Major page faults (I/O): $MAJOR_FAULTS"
+    [ -n "$MINOR_FAULTS" ] && echo "Minor page faults:       $MINOR_FAULTS"
+
+    if [ -n "$L1_LOADS" ] && [ "$L1_LOADS" -gt 0 ]; then
+        L1_MISS_PCT=$(awk "BEGIN {printf \"%.2f\", ($L1_MISS_RATE / $L1_LOADS) * 100}")
+        echo "L1 cache miss rate:      $L1_MISS_PCT%"
+    fi
+
+    if [ -n "$LLC_LOADS" ] && [ "$LLC_LOADS" -gt 0 ]; then
+        LLC_MISS_PCT=$(awk "BEGIN {printf \"%.2f\", ($LLC_MISS_RATE / $LLC_LOADS) * 100}")
+        echo "L3 cache miss rate:      $LLC_MISS_PCT%"
+    fi
+
+    if [ -n "$BRANCH_INSTRUCTIONS" ] && [ "$BRANCH_INSTRUCTIONS" -gt 0 ]; then
+        BRANCH_MISS_PCT=$(awk "BEGIN {printf \"%.2f\", ($BRANCH_MISSES / $BRANCH_INSTRUCTIONS) * 100}")
+        echo "Branch miss rate:        $BRANCH_MISS_PCT%"
+    fi
+
+    if [ -n "$INSTRUCTIONS" ] && [ "$CYCLES" -gt 0 ]; then
+        IPC=$(awk "BEGIN {printf \"%.3f\", $INSTRUCTIONS / $CYCLES}")
+        echo "Instructions per cycle:  $IPC"
+    fi
+    echo ""
+fi
 
 # Check if pprof is available
 if ! command -v pprof &> /dev/null; then
@@ -137,21 +209,14 @@ if ! command -v pprof &> /dev/null; then
     exit 0
 fi
 
-echo "=== Profile Report (Text) ==="
+echo "=== CPU Profile Report (Top Functions) ==="
 echo ""
-pprof --text "$PROFILE_BINARY" "$PROFILE_DATA" | head -40
+pprof --text "$PROFILE_BINARY" "$PROFILE_DATA" | head -30
 
 echo ""
-echo "=== Profile Report (Top Functions by CPU Time) ==="
+echo "=== Analysis & Further Reports ==="
 echo ""
-pprof --text "$PROFILE_BINARY" "$PROFILE_DATA" | grep -E "^\s+[0-9]" | head -20
-
-echo ""
-echo "=== Additional Analysis ==="
-echo ""
-echo "Generate detailed reports:"
-echo ""
-echo "Text report (top 30):"
+echo "Detailed CPU profile (top 30):"
 echo "  pprof --text $PROFILE_BINARY $PROFILE_DATA | head -30"
 echo ""
 echo "Flame graph (requires graphviz):"
@@ -160,8 +225,10 @@ echo ""
 echo "Web-based interactive graph (requires dot):"
 echo "  pprof --web $PROFILE_BINARY $PROFILE_DATA"
 echo ""
-echo "Function list:"
+echo "Function-specific analysis:"
 echo "  pprof --list=<function_name> $PROFILE_BINARY $PROFILE_DATA"
 echo ""
-echo "Profile data: $PROFILE_DATA"
-echo "Binary: $PROFILE_BINARY"
+echo "Files generated:"
+echo "  CPU profile data:  $PROFILE_DATA"
+echo "  Memory metrics:    $PERF_REPORT"
+echo "  Binary:            $PROFILE_BINARY"
