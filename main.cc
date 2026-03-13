@@ -11,6 +11,7 @@
 #include <chrono>
 #include <mutex>
 #include <ctime>
+#include <charconv>
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -248,18 +249,21 @@ int main(int argc, char* argv[]) {
     // Can be overridden via argv[4]
     unsigned int num_threads = (num_cpus * 2) - 1;
     if (argc >= 5) {
-        try {
-            int user_threads = std::stoi(argv[4]);
-            if (user_threads <= 0) {
-                std::cerr << "Error: num_threads must be > 0" << std::endl;
-                return 1;
-            }
-            num_threads = static_cast<unsigned int>(user_threads);
-            std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "Error parsing num_threads: " << e.what() << std::endl;
+        int user_threads;
+        const char* arg_start = argv[4];
+        const char* arg_end = argv[4] + std::string(argv[4]).length();
+        auto result = std::from_chars(arg_start, arg_end, user_threads);
+
+        if (result.ec != std::errc{}) {
+            std::cerr << "Error: Invalid num_threads value" << std::endl;
             return 1;
         }
+        if (user_threads <= 0) {
+            std::cerr << "Error: num_threads must be > 0" << std::endl;
+            return 1;
+        }
+        num_threads = static_cast<unsigned int>(user_threads);
+        std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
     } else {
         std::cout << "Number of threads (default): " << num_threads << std::endl;
     }
