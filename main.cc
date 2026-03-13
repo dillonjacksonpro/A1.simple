@@ -48,6 +48,51 @@ ReducedMedicareRecord parse_medicate_record(const std::string& line) {
     return record;
 }
 
+// Fine-grained inline functions for profiling
+inline void align_region_start(const char* data_ptr, size_t& start, size_t end, bool should_align) {
+    if (should_align) {
+        while (start < end && data_ptr[start] != '\n') {
+            ++start;
+        }
+        ++start;
+    }
+}
+
+inline void align_region_end(const char* data_ptr, size_t& line_end, size_t start, bool should_align) {
+    if (should_align) {
+        while (line_end > start && data_ptr[line_end - 1] != '\n') {
+            --line_end;
+        }
+    }
+}
+
+inline void process_region_lines(const char* data_ptr, size_t start, size_t line_end,
+                                  std::unordered_map<std::string, double>& aggregated_data) {
+    size_t pos = start;
+    while (pos < line_end) {
+        size_t next_newline = pos;
+        while (next_newline < line_end && data_ptr[next_newline] != '\n') {
+            ++next_newline;
+        }
+
+        std::string line(data_ptr + pos, next_newline - pos);
+        try {
+            ReducedMedicareRecord record = parse_medicate_record(line);
+            aggregated_data[record.hcpcs_code] += record.total_paid;
+        } catch (const std::exception& e) {
+            std::cerr << "Error parsing line: " << e.what() << std::endl;
+        }
+        pos = next_newline + 1;
+    }
+}
+
+inline void merge_aggregated_data(std::unordered_map<std::string, double>& global_data,
+                                   const std::unordered_map<std::string, double>& local_data) {
+    for (const auto& [hcpcs_code, total_paid] : local_data) {
+        global_data[hcpcs_code] += total_paid;
+    }
+}
+
 class TimingTracker {
     struct ThreadTiming {
         std::string name;
@@ -98,20 +143,54 @@ public:
         }
 
         timing_file << "=== Timing Report ===" << std::endl;
-        timing_file << std::left << std::setw(40) << "Thread/Task"
-                    << std::setw(25) << "Wall Time (ms)"
-                    << "CPU Time (ms)" << std::endl;
-        timing_file << std::string(85, '-') << std::endl;
+        timing_file << std::left << std::setw(30) << "Thread/Task"
+                    << std::setw(40) << "Wall Time"
+                    << "CPU Time" << std::endl;
+        timing_file << std::string(100, '-') << std::endl;
 
-        timing_file << std::fixed << std::setprecision(6);
+        // Create a sorted vector with main first
+        std::vector<std::pair<std::string, const ThreadTiming*>> sorted_timings;
+        std::string main_label;
+        const ThreadTiming* main_timing = nullptr;
+
         for (const auto& [id, timing] : timings_) {
             std::string thread_label = "Thread " + std::to_string(std::hash<std::thread::id>{}(id) % 10000);
             if (!timing.name.empty()) {
                 thread_label = timing.name;
             }
-            timing_file << std::left << std::setw(40) << thread_label
-                        << std::setw(25) << timing.wall_elapsed_ms
-                        << timing.cpu_elapsed_ms << std::endl;
+
+            if (thread_label == "main") {
+                main_label = thread_label;
+                main_timing = &timing;
+            } else {
+                sorted_timings.push_back({thread_label, &timing});
+            }
+        }
+
+        // Lambda to format time with both ms and seconds
+        auto format_time = [](double ms) -> std::string {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << ms << " ms ("
+                << std::fixed << std::setprecision(3) << (ms / 1000.0) << " s)";
+            return oss.str();
+        };
+
+        // Print main first if it exists
+        if (main_timing != nullptr) {
+            timing_file << std::left << std::setw(30) << main_label
+                        << std::setw(40) << format_time(main_timing->wall_elapsed_ms)
+                        << format_time(main_timing->cpu_elapsed_ms) << std::endl;
+        }
+
+        // Sort remaining timings by label
+        std::sort(sorted_timings.begin(), sorted_timings.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        // Print worker timings
+        for (const auto& [label, timing] : sorted_timings) {
+            timing_file << std::left << std::setw(30) << label
+                        << std::setw(40) << format_time(timing->wall_elapsed_ms)
+                        << format_time(timing->cpu_elapsed_ms) << std::endl;
         }
         timing_file.close();
     }
@@ -211,60 +290,27 @@ int main(int argc, char* argv[]) {
 
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
-            // Start timing for this thread
             g_timer.start("worker_" + std::to_string(i));
 
             // Calculate byte boundaries
             size_t start = data_start + (i * chunk_size);
             size_t end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * chunk_size);
 
-            // Align start: skip to next newline (except for region 0 which already at line start)
-            if (i > 0) {
-                while (start < end && data_ptr[start] != '\n') {
-                    ++start;
-                }
-                ++start;  // Move past the '\n' to start of next complete line
-            }
-
-            // Align end: back up to previous newline (except for last region)
+            // Align region boundaries to line boundaries
+            align_region_start(data_ptr, start, end, i > 0);
             size_t line_end = end;
-            if (i < num_threads - 1) {
-                while (line_end > start && data_ptr[line_end - 1] != '\n') {
-                    --line_end;
-                }
-            }
+            align_region_end(data_ptr, line_end, start, i < num_threads - 1);
 
-            // Process complete lines in [start, line_end)
+            // Process lines in this region
             std::unordered_map<std::string, double> aggregated_data;
-            size_t pos = start;
+            process_region_lines(data_ptr, start, line_end, aggregated_data);
 
-            while (pos < line_end) {
-                // Find next newline
-                size_t next_newline = pos;
-                while (next_newline < line_end && data_ptr[next_newline] != '\n') {
-                    ++next_newline;
-                }
-
-                // Extract and process line
-                std::string line(data_ptr + pos, next_newline - pos);
-                try {
-                    ReducedMedicareRecord record = parse_medicate_record(line);
-                    aggregated_data[record.hcpcs_code] += record.total_paid;
-                } catch (const std::exception& e) {
-                    std::cerr << "Error parsing line: " << e.what() << std::endl;
-                }
-                pos = next_newline + 1;
-            }
-
-            // Merge aggregated data into combined map
+            // Merge results into global aggregation
             #pragma omp critical
             {
-                for (const auto& [hcpcs_code, total_paid] : aggregated_data) {
-                    aggregated_data_combined[hcpcs_code] += total_paid;
-                }
+                merge_aggregated_data(aggregated_data_combined, aggregated_data);
             }
 
-            // Stop timing for this thread
             g_timer.stop();
         }
     } catch (...) {
@@ -304,3 +350,7 @@ int main(int argc, char* argv[]) {
     return 0;
 
 }
+
+
+// to do add seconds to the time, have main time at top
+// add an arg to tell it how many cores it has
