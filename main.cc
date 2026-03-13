@@ -361,10 +361,6 @@ int main(int argc, char* argv[]) {
         size_t data_size = file_size - data_start;
         size_t chunk_size = data_size / num_threads;
 
-        // Thread-local storage: each thread stores results without locking
-        std::vector<std::unordered_map<uint64_t, double>> thread_aggregated_data(num_threads);
-        std::vector<std::unordered_map<uint64_t, std::string>> thread_key_maps(num_threads);
-
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
             g_timer.start("worker_" + std::to_string(i));
@@ -379,18 +375,20 @@ int main(int argc, char* argv[]) {
             align_region_end(data_ptr, line_end, start, i < num_threads - 1);
 
             // Process lines in this region with pre-allocated hash table (512 entries)
-            thread_aggregated_data[i].reserve(512);
-            thread_key_maps[i].reserve(512);
+            std::unordered_map<uint64_t, double> aggregated_data;
+            aggregated_data.reserve(512);
+            std::unordered_map<uint64_t, std::string> local_key_map;
+            local_key_map.reserve(512);
 
-            process_region_lines(data_ptr, start, line_end, thread_aggregated_data[i], thread_key_maps[i]);
+            process_region_lines(data_ptr, start, line_end, aggregated_data, local_key_map);
+
+            // Merge results into global aggregation (uint64_t keyed)
+            #pragma omp critical
+            {
+                merge_aggregated_data(aggregated_data_combined, global_key_map, aggregated_data, local_key_map);
+            }
 
             g_timer.stop();
-        }
-
-        // Lock-free merge: sequentially combine all thread-local results
-        for (unsigned int i = 0; i < num_threads; ++i) {
-            merge_aggregated_data(aggregated_data_combined, global_key_map,
-                                 thread_aggregated_data[i], thread_key_maps[i]);
         }
     } catch (...) {
         munmap(file_data, file_size);
