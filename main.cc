@@ -30,8 +30,18 @@ struct MedicareRecord {
 
 struct ReducedMedicareRecord {
     std::string hcpcs_code;
+    uint64_t hcpcs_key;
     double total_paid;
 };
+
+// Convert string (≤8 chars) to uint64_t for hashing
+inline uint64_t string_to_key(const std::string& s) {
+    uint64_t key = 0;
+    for (size_t i = 0; i < std::min(s.size(), size_t(8)); ++i) {
+        key = (key << 8) | static_cast<uint8_t>(s[i]);
+    }
+    return key;
+}
 
 // Parse record directly from buffer to avoid string allocation
 ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
@@ -50,9 +60,9 @@ ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* 
                 // Use from_chars for fast double parsing
                 auto result = std::from_chars(field_start, i, total_paid);
                 if (result.ec != std::errc{}) {
-                    return {hcpcs_code, 0.0};  // Return with default value on parse error
+                    return {hcpcs_code, string_to_key(hcpcs_code), 0.0};
                 }
-                return {hcpcs_code, total_paid};  // Early return once we have both fields
+                return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
             }
 
             field_idx++;
@@ -62,7 +72,7 @@ ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* 
         }
     }
 
-    return {hcpcs_code, total_paid};  // Return whatever we parsed
+    return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
 }
 
 // Fine-grained inline functions for profiling
@@ -84,7 +94,8 @@ inline void align_region_end(const char* data_ptr, size_t& line_end, size_t star
 }
 
 inline void process_region_lines(const char* data_ptr, size_t start, size_t line_end,
-                                  std::unordered_map<std::string, double>& aggregated_data) {
+                                  std::unordered_map<uint64_t, double>& aggregated_data,
+                                  std::unordered_map<uint64_t, std::string>& key_map) {
     size_t pos = start;
     while (pos < line_end) {
         size_t next_newline = pos;
@@ -94,16 +105,29 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t line
 
         // Parse directly from buffer without creating temporary string
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
-        aggregated_data[record.hcpcs_code] += record.total_paid;
+        aggregated_data[record.hcpcs_key] += record.total_paid;
+        // Track original string for this key (only store once)
+        if (key_map.find(record.hcpcs_key) == key_map.end()) {
+            key_map[record.hcpcs_key] = record.hcpcs_code;
+        }
 
         pos = next_newline + 1;
     }
 }
 
-inline void merge_aggregated_data(std::unordered_map<std::string, double>& global_data,
-                                   const std::unordered_map<std::string, double>& local_data) {
-    for (const auto& [hcpcs_code, total_paid] : local_data) {
-        global_data[hcpcs_code] += total_paid;
+inline void merge_aggregated_data(std::unordered_map<uint64_t, double>& global_data,
+                                   std::unordered_map<uint64_t, std::string>& key_to_code,
+                                   const std::unordered_map<uint64_t, double>& local_data,
+                                   const std::unordered_map<uint64_t, std::string>& local_key_map) {
+    for (const auto& [key, total_paid] : local_data) {
+        global_data[key] += total_paid;
+        // Store original string mapping if not already present
+        if (key_to_code.find(key) == key_to_code.end()) {
+            auto it = local_key_map.find(key);
+            if (it != local_key_map.end()) {
+                key_to_code[key] = it->second;
+            }
+        }
     }
 }
 
@@ -294,9 +318,11 @@ int main(int argc, char* argv[]) {
         std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
     }
 
-    // create map to store aggregated data
-    // key is hcpcs_code, value is total paid
-    std::unordered_map<std::string, double> aggregated_data_combined;
+    // create map to store aggregated data with uint64_t keys for faster hashing
+    // key is hcpcs_code (as uint64_t), value is total paid
+    std::unordered_map<uint64_t, double> aggregated_data_combined;
+    // Global mappings for key -> code (declared outside try block for use after)
+    std::unordered_map<uint64_t, std::string> global_key_map;
 
     int fd = open(args.input_path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("Cannot open file");
@@ -348,14 +374,18 @@ int main(int argc, char* argv[]) {
             size_t line_end = end;
             align_region_end(data_ptr, line_end, start, i < num_threads - 1);
 
-            // Process lines in this region
-            std::unordered_map<std::string, double> aggregated_data;
-            process_region_lines(data_ptr, start, line_end, aggregated_data);
+            // Process lines in this region with pre-allocated hash table (512 entries)
+            std::unordered_map<uint64_t, double> aggregated_data;
+            aggregated_data.reserve(512);
+            std::unordered_map<uint64_t, std::string> local_key_map;
+            local_key_map.reserve(512);
 
-            // Merge results into global aggregation
+            process_region_lines(data_ptr, start, line_end, aggregated_data, local_key_map);
+
+            // Merge results into global aggregation (uint64_t keyed)
             #pragma omp critical
             {
-                merge_aggregated_data(aggregated_data_combined, aggregated_data);
+                merge_aggregated_data(aggregated_data_combined, global_key_map, aggregated_data, local_key_map);
             }
 
             g_timer.stop();
@@ -369,9 +399,16 @@ int main(int argc, char* argv[]) {
     munmap(file_data, file_size);
     close(fd);
 
+    // Convert uint64_t keys back to strings for output
+    std::vector<std::pair<std::string, double>> sorted_data;
+    for (const auto& [key, total_paid] : aggregated_data_combined) {
+        auto code_it = global_key_map.find(key);
+        if (code_it != global_key_map.end()) {
+            sorted_data.emplace_back(code_it->second, total_paid);
+        }
+    }
+
     // Sort aggregated data by total_paid (descending) before writing
-    std::vector<std::pair<std::string, double>> sorted_data(aggregated_data_combined.begin(),
-                                                             aggregated_data_combined.end());
     std::sort(sorted_data.begin(), sorted_data.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 

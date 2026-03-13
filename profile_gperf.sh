@@ -63,6 +63,7 @@ cd "$SCRIPT_DIR"
 
 PROFILE_BINARY="main_gperf"
 PROFILE_DATA="main.prof"
+HEAP_PROFILE="main_heap.prof"
 PERF_REPORT="perf_report.txt"
 
 # Verify input file exists
@@ -109,18 +110,20 @@ g++ \
 echo "✓ Profile binary created: $PROFILE_BINARY"
 echo ""
 
-echo "=== Running with CPU Profiling ==="
-echo "Profile data will be written to: $PROFILE_DATA"
-if [ "$PERF_AVAILABLE" = true ]; then
-    echo "Cache/page fault metrics will be written to: $PERF_REPORT"
-fi
+echo "=== Running with CPU & Heap Profiling ==="
+echo "CPU profile data will be written to: $PROFILE_DATA"
+echo "Heap profile data will be written to: $HEAP_PROFILE*"
 echo ""
 
-# Run with CPU profiling enabled
-# CPUPROFILE: Output file for profiling data
-# CPUPROFILE_FREQUENCY: Sampling frequency (Hz) - default is 100
+# Run with CPU and heap profiling enabled
+# CPUPROFILE: CPU profiling output file
+# CPUPROFILE_FREQUENCY: Sampling frequency (Hz)
+# HEAPPROFILE: Heap profiling output file (tracks memory allocations)
+# HEAP_PROFILE_ALLOCATION_INTERVAL: Sample every N bytes (default 1MB)
 export CPUPROFILE="$PROFILE_DATA"
 export CPUPROFILE_FREQUENCY=100
+export HEAPPROFILE="$HEAP_PROFILE"
+export HEAP_PROFILE_ALLOCATION_INTERVAL=1048576  # 1MB - captures allocation patterns
 
 # Build command with arguments
 CMD=("./$PROFILE_BINARY" --input "$INPUT_FILE")
@@ -146,6 +149,8 @@ fi
 
 unset CPUPROFILE
 unset CPUPROFILE_FREQUENCY
+unset HEAPPROFILE
+unset HEAP_PROFILE_ALLOCATION_INTERVAL
 
 echo ""
 echo "✓ Profiling complete"
@@ -213,6 +218,20 @@ echo "=== CPU Profile Report (Top Functions) ==="
 echo ""
 pprof --text "$PROFILE_BINARY" "$PROFILE_DATA" | head -30
 
+# Check for heap profile data
+HEAP_PROFILE_FILE=$(ls -1 "${HEAP_PROFILE}"*.* 2>/dev/null | head -1)
+if [ -n "$HEAP_PROFILE_FILE" ]; then
+    echo ""
+    echo "=== Heap Profile Report (Memory Allocations) ==="
+    echo ""
+    pprof --text "$PROFILE_BINARY" "$HEAP_PROFILE_FILE" | head -30
+    echo ""
+    echo "Heap profile shows memory allocation patterns:"
+    echo "  - High allocations in hash table = contention/rehashing"
+    echo "  - String allocations in parse = potential bottleneck"
+    echo "  - Peak heap usage indicates memory pressure → more page faults"
+fi
+
 echo ""
 echo "=== Analysis & Further Reports ==="
 echo ""
@@ -228,7 +247,12 @@ echo ""
 echo "Function-specific analysis:"
 echo "  pprof --list=<function_name> $PROFILE_BINARY $PROFILE_DATA"
 echo ""
+echo "Heap profile analysis:"
+echo "  pprof --text $PROFILE_BINARY ${HEAP_PROFILE}*.* | head -30"
+echo "  pprof --svg $PROFILE_BINARY ${HEAP_PROFILE}*.* > heap_profile.svg"
+echo ""
 echo "Files generated:"
 echo "  CPU profile data:  $PROFILE_DATA"
-echo "  Memory metrics:    $PERF_REPORT"
+echo "  Heap profile data: ${HEAP_PROFILE}*.* (suffix added by gperftools)"
+echo "  Memory metrics:    $PERF_REPORT (if perf available)"
 echo "  Binary:            $PROFILE_BINARY"
