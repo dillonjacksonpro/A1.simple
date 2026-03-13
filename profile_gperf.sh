@@ -1,23 +1,62 @@
 #!/bin/bash
 # Profiling script: Google Performance Tools (gperftools) CPU profiler
+# Uses named arguments matching the main binary
 
 set -e  # Exit on error
 
-# Check arguments
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <input_file> [num_threads]"
-    echo ""
-    echo "Arguments:"
-    echo "  input_file      Input CSV file to process"
-    echo "  num_threads     Optional: number of threads to use"
-    echo ""
-    echo "Example: $0 data.csv"
-    echo "Example: $0 data.csv 8"
+# Parse named arguments
+INPUT_FILE=""
+OUTPUT_FILE=""
+TIMING_FILE=""
+NUM_THREADS=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --input|-i)
+            INPUT_FILE="$2"
+            shift 2
+            ;;
+        --output|-o)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        --timing|-t)
+            TIMING_FILE="$2"
+            shift 2
+            ;;
+        --threads|-n)
+            NUM_THREADS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 --input <path> [options]"
+            echo ""
+            echo "Required arguments:"
+            echo "  --input, -i <path>         Input CSV file path"
+            echo ""
+            echo "Optional arguments:"
+            echo "  --output, -o <path>        Output CSV file path (default: output.csv)"
+            echo "  --timing, -t <path>        Timing report file path (default: timing.txt)"
+            echo "  --threads, -n <count>      Number of threads to use (default: cpus * 2 - 1)"
+            echo "  --help, -h                 Show this help message"
+            echo ""
+            echo "Example:"
+            echo "  $0 --input data.csv --output results.csv --threads 8"
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate required argument
+if [ -z "$INPUT_FILE" ]; then
+    echo "Error: --input (or -i) is required"
+    echo "Use --help for usage information"
     exit 1
 fi
-
-INPUT_FILE="$1"
-NUM_THREADS="${2:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -73,13 +112,14 @@ echo ""
 export CPUPROFILE="$PROFILE_DATA"
 export CPUPROFILE_FREQUENCY=100
 
-if [ -n "$NUM_THREADS" ]; then
-    echo "Running: $PROFILE_BINARY $INPUT_FILE output.csv timing.csv $NUM_THREADS"
-    ./"$PROFILE_BINARY" "$INPUT_FILE" output.csv timing.csv "$NUM_THREADS"
-else
-    echo "Running: $PROFILE_BINARY $INPUT_FILE output.csv timing.csv"
-    ./"$PROFILE_BINARY" "$INPUT_FILE" output.csv timing.csv
-fi
+# Build command with arguments
+CMD=("./$PROFILE_BINARY" --input "$INPUT_FILE")
+[ -n "$OUTPUT_FILE" ] && CMD+=(--output "$OUTPUT_FILE")
+[ -n "$TIMING_FILE" ] && CMD+=(--timing "$TIMING_FILE")
+[ -n "$NUM_THREADS" ] && CMD+=(--threads "$NUM_THREADS")
+
+echo "Running: ${CMD[@]}"
+"${CMD[@]}"
 
 unset CPUPROFILE
 unset CPUPROFILE_FREQUENCY
