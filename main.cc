@@ -7,6 +7,10 @@
 #include <thread>
 #include <filesystem>
 #include <algorithm>
+#include <iomanip>
+#include <chrono>
+#include <mutex>
+#include <ctime>
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,10 +48,83 @@ ReducedMedicareRecord parse_medicate_record(const std::string& line) {
     return record;
 }
 
+class TimingTracker {
+    struct ThreadTiming {
+        std::string name;
+        std::chrono::high_resolution_clock::time_point wall_start;
+        clock_t cpu_start;
+        double wall_elapsed_ms;
+        double cpu_elapsed_ms;
+    };
+
+    std::unordered_map<std::thread::id, ThreadTiming> timings_;
+    mutable std::mutex mutex_;
+
+public:
+    void start(const std::string& name = "") {
+        auto id = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lock(mutex_);
+        timings_[id] = {
+            name,
+            std::chrono::high_resolution_clock::now(),
+            std::clock(),
+            0.0,
+            0.0
+        };
+    }
+
+    void stop() {
+        auto id = std::this_thread::get_id();
+        auto now_wall = std::chrono::high_resolution_clock::now();
+        auto now_cpu = std::clock();
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timings_.find(id) == timings_.end()) {
+            return;
+        }
+
+        auto& timing = timings_[id];
+        timing.wall_elapsed_ms = std::chrono::duration<double, std::milli>(
+            now_wall - timing.wall_start).count();
+        timing.cpu_elapsed_ms = static_cast<double>(now_cpu - timing.cpu_start) / CLOCKS_PER_SEC * 1000.0;
+    }
+
+    void report(const std::string& filepath) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ofstream timing_file(filepath);
+        if (!timing_file.is_open()) {
+            std::cerr << "Cannot open timing file: " << filepath << std::endl;
+            return;
+        }
+
+        timing_file << "=== Timing Report ===" << std::endl;
+        timing_file << std::left << std::setw(40) << "Thread/Task"
+                    << std::setw(25) << "Wall Time (ms)"
+                    << "CPU Time (ms)" << std::endl;
+        timing_file << std::string(85, '-') << std::endl;
+
+        timing_file << std::fixed << std::setprecision(6);
+        for (const auto& [id, timing] : timings_) {
+            std::string thread_label = "Thread " + std::to_string(std::hash<std::thread::id>{}(id) % 10000);
+            if (!timing.name.empty()) {
+                thread_label = timing.name;
+            }
+            timing_file << std::left << std::setw(40) << thread_label
+                        << std::setw(25) << timing.wall_elapsed_ms
+                        << timing.cpu_elapsed_ms << std::endl;
+        }
+        timing_file.close();
+    }
+};
+
+// Global timing tracker
+TimingTracker g_timer;
+
 int main(int argc, char* argv[]) {
+    g_timer.start("main");
     // arg 1 is input path
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input_path> [output_path]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_path> [output_path] [timing_path]" << std::endl;
         return 1;
     }
     std::string input_path = argv[1];
@@ -69,6 +146,17 @@ int main(int argc, char* argv[]) {
     // check if output path is valid
     if (output_path.empty()) {
         std::cerr << "Output path cannot be empty." << std::endl;
+        return 1;
+    }
+
+    std::string timing_path = "timing.txt";
+    // arg 3 is timing path
+    if (argc >= 4) {
+        timing_path = argv[3];
+    }
+    // check if timing path is valid
+    if (timing_path.empty()) {
+        std::cerr << "Timing path cannot be empty." << std::endl;
         return 1;
     }
 
@@ -123,6 +211,9 @@ int main(int argc, char* argv[]) {
 
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
+            // Start timing for this thread
+            g_timer.start("worker_" + std::to_string(i));
+
             // Calculate byte boundaries
             size_t start = data_start + (i * chunk_size);
             size_t end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * chunk_size);
@@ -172,6 +263,9 @@ int main(int argc, char* argv[]) {
                     aggregated_data_combined[hcpcs_code] += total_paid;
                 }
             }
+
+            // Stop timing for this thread
+            g_timer.stop();
         }
     } catch (...) {
         munmap(file_data, file_size);
@@ -195,11 +289,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     output_file << "hcpcs_code,total_paid" << std::endl;
+    output_file << std::fixed << std::setprecision(2);
     for (const auto& [hcpcs_code, total_paid] : sorted_data) {
         output_file << hcpcs_code << "," << total_paid << std::endl;
     }
     output_file.close();
     std::cout << "Aggregation complete. Output written to: " << output_path << std::endl;
+
+    // Stop main thread timing and report
+    g_timer.stop();
+    g_timer.report(timing_path);
+    std::cout << "Timing report written to: " << timing_path << std::endl;
+
     return 0;
 
 }
