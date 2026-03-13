@@ -203,7 +203,7 @@ int main(int argc, char* argv[]) {
     g_timer.start("main");
     // arg 1 is input path
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input_path> [output_path] [timing_path]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_path> [output_path] [timing_path] [num_threads]" << std::endl;
         return 1;
     }
     std::string input_path = argv[1];
@@ -243,9 +243,26 @@ int main(int argc, char* argv[]) {
     unsigned int num_cpus = std::thread::hardware_concurrency();
     std::cout << "Number of CPUs: " << num_cpus << std::endl;
 
-    // get number of threads to use (cpus * 2) - 1
+    // get number of threads to use
+    // Default: (cpus * 2) - 1
+    // Can be overridden via argv[4]
     unsigned int num_threads = (num_cpus * 2) - 1;
-    std::cout << "Number of threads to use: " << num_threads << std::endl;
+    if (argc >= 5) {
+        try {
+            int user_threads = std::stoi(argv[4]);
+            if (user_threads <= 0) {
+                std::cerr << "Error: num_threads must be > 0" << std::endl;
+                return 1;
+            }
+            num_threads = static_cast<unsigned int>(user_threads);
+            std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error parsing num_threads: " << e.what() << std::endl;
+            return 1;
+        }
+    } else {
+        std::cout << "Number of threads (default): " << num_threads << std::endl;
+    }
 
     // create map to store aggregated data
     // key is hcpcs_code, value is total paid
