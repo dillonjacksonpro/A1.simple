@@ -369,6 +369,9 @@ int main(int argc, char* argv[]) {
             size_t start = data_start + (i * chunk_size);
             size_t end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * chunk_size);
 
+            // Thread-level prefetch: tell kernel to load this chunk (non-blocking)
+            madvise(const_cast<char*>(data_ptr) + start, end - start, MADV_WILLNEED);
+
             // Align region boundaries to line boundaries
             align_region_start(data_ptr, start, end, i > 0);
             size_t line_end = end;
