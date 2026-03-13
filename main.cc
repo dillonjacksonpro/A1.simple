@@ -10,6 +10,7 @@
 #include <chrono>
 #include <mutex>
 #include <ctime>
+#include <cstring>
 #include <charconv>
 #include <omp.h>
 #include <sys/mman.h>
@@ -212,79 +213,92 @@ public:
 // Global timing tracker
 TimingTracker g_timer;
 
+struct CommandLineArguments {
+    std::string input_path;
+    std::string output_path = "output.csv";
+    std::string timing_path = "timing.txt";
+    unsigned int num_threads = 0;  // 0 means use default (cpus * 2 - 1)
+};
+
+CommandLineArguments parse_arguments(int argc, char* argv[]) {
+    CommandLineArguments args;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if ((arg == "--input" || arg == "-i") && i + 1 < argc) {
+            args.input_path = argv[++i];
+        } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
+            args.output_path = argv[++i];
+        } else if ((arg == "--timing" || arg == "-t") && i + 1 < argc) {
+            args.timing_path = argv[++i];
+        } else if ((arg == "--threads" || arg == "-n") && i + 1 < argc) {
+            const char* threads_str = argv[++i];
+            int threads_value;
+            auto result = std::from_chars(threads_str, threads_str + std::strlen(threads_str), threads_value);
+            if (result.ec != std::errc{} || threads_value <= 0) {
+                throw std::runtime_error("Invalid --threads value: must be a positive integer");
+            }
+            args.num_threads = static_cast<unsigned int>(threads_value);
+        } else if (arg == "--help" || arg == "-h") {
+            throw std::runtime_error("Help requested");
+        } else {
+            throw std::runtime_error("Unknown argument: " + arg);
+        }
+    }
+
+    if (args.input_path.empty()) {
+        throw std::runtime_error("--input (or -i) is required");
+    }
+
+    return args;
+}
+
 int main(int argc, char* argv[]) {
     g_timer.start("main");
-    // arg 1 is input path
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input_path> [output_path] [timing_path] [num_threads]" << std::endl;
-        return 1;
-    }
-    std::string input_path = argv[1];
-    // check if input is valid
-    if (input_path.empty()) {
-        std::cerr << "Input path cannot be empty." << std::endl;
-        return 1;
-    }
-    // check if input exists
-    if (!std::filesystem::exists(input_path)) {
-        std::cerr << "Input path does not exist: " << input_path << std::endl;
-        return 1;
-    }
-    std::string output_path = "output.csv";
-    // arg 2 is output path
-    if (argc >= 3) {
-        output_path = argv[2];
-    }
-    // check if output path is valid
-    if (output_path.empty()) {
-        std::cerr << "Output path cannot be empty." << std::endl;
+
+    // Parse command-line arguments
+    CommandLineArguments args;
+    try {
+        args = parse_arguments(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        std::cerr << "\nUsage: " << argv[0] << " --input <path> [options]" << std::endl;
+        std::cerr << "\nRequired arguments:\n";
+        std::cerr << "  --input, -i <path>         Input CSV file path\n";
+        std::cerr << "\nOptional arguments:\n";
+        std::cerr << "  --output, -o <path>        Output CSV file path (default: output.csv)\n";
+        std::cerr << "  --timing, -t <path>        Timing report file path (default: timing.txt)\n";
+        std::cerr << "  --threads, -n <count>      Number of threads to use (default: cpus * 2 - 1)\n";
+        std::cerr << "  --help, -h                 Show this help message\n";
+        std::cerr << "\nExample:\n";
+        std::cerr << "  " << argv[0] << " --input data.csv --output results.csv --threads 8\n";
         return 1;
     }
 
-    std::string timing_path = "timing.txt";
-    // arg 3 is timing path
-    if (argc >= 4) {
-        timing_path = argv[3];
-    }
-    // check if timing path is valid
-    if (timing_path.empty()) {
-        std::cerr << "Timing path cannot be empty." << std::endl;
+    // Validate input path
+    if (!std::filesystem::exists(args.input_path)) {
+        std::cerr << "Error: Input file does not exist: " << args.input_path << std::endl;
         return 1;
     }
 
-    // get number of cpus
+    // Get number of CPUs and determine thread count
     unsigned int num_cpus = std::thread::hardware_concurrency();
     std::cout << "Number of CPUs: " << num_cpus << std::endl;
 
-    // get number of threads to use
-    // Default: (cpus * 2) - 1
-    // Can be overridden via argv[4]
-    unsigned int num_threads = (num_cpus * 2) - 1;
-    if (argc >= 5) {
-        int user_threads;
-        const char* arg_start = argv[4];
-        const char* arg_end = argv[4] + std::string(argv[4]).length();
-        auto result = std::from_chars(arg_start, arg_end, user_threads);
-
-        if (result.ec != std::errc{}) {
-            std::cerr << "Error: Invalid num_threads value" << std::endl;
-            return 1;
-        }
-        if (user_threads <= 0) {
-            std::cerr << "Error: num_threads must be > 0" << std::endl;
-            return 1;
-        }
-        num_threads = static_cast<unsigned int>(user_threads);
-        std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
-    } else {
+    unsigned int num_threads = args.num_threads;
+    if (num_threads == 0) {
+        num_threads = (num_cpus * 2) - 1;
         std::cout << "Number of threads (default): " << num_threads << std::endl;
+    } else {
+        std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
     }
 
     // create map to store aggregated data
     // key is hcpcs_code, value is total paid
     std::unordered_map<std::string, double> aggregated_data_combined;
 
-    int fd = open(input_path.c_str(), O_RDONLY);
+    int fd = open(args.input_path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("Cannot open file");
 
     // get file size
@@ -362,9 +376,9 @@ int main(int argc, char* argv[]) {
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
     // Create output file and write aggregated data
-    std::ofstream output_file(output_path);
+    std::ofstream output_file(args.output_path);
     if (!output_file.is_open()) {
-        std::cerr << "Cannot open output file: " << output_path << std::endl;
+        std::cerr << "Cannot open output file: " << args.output_path << std::endl;
         return 1;
     }
     output_file << "hcpcs_code,total_paid" << std::endl;
@@ -373,17 +387,14 @@ int main(int argc, char* argv[]) {
         output_file << hcpcs_code << "," << total_paid << std::endl;
     }
     output_file.close();
-    std::cout << "Aggregation complete. Output written to: " << output_path << std::endl;
+    std::cout << "Aggregation complete. Output written to: " << args.output_path << std::endl;
 
     // Stop main thread timing and report
     g_timer.stop();
-    g_timer.report(timing_path);
-    std::cout << "Timing report written to: " << timing_path << std::endl;
+    g_timer.report(args.timing_path);
+    std::cout << "Timing report written to: " << args.timing_path << std::endl;
 
     return 0;
 
 }
 
-
-// to do add seconds to the time, have main time at top
-// add an arg to tell it how many cores it has
