@@ -4,13 +4,14 @@
 set -e  # Exit on error
 
 # Check arguments
-if [ $# -lt 2 ]; then
+if [ $# -lt 1 ]; then
     echo "Usage: $0 <input_file> [num_threads]"
     echo ""
     echo "Arguments:"
     echo "  input_file      Input CSV file to process"
     echo "  num_threads     Optional: number of threads to use"
     echo ""
+    echo "Example: $0 data.csv"
     echo "Example: $0 data.csv 8"
     exit 1
 fi

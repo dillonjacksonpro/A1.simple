@@ -1,6 +1,5 @@
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,19 +33,34 @@ struct ReducedMedicareRecord {
 };
 
 ReducedMedicareRecord parse_medicate_record(const std::string& line) {
-    std::istringstream ss(line);
-    std::string token;
-    std::vector<std::string> tokens;
-    while (std::getline(ss, token, ',')) {
-        tokens.push_back(token);
+    // Manual CSV parsing: only extract fields 2 (hcpcs_code) and 6 (total_paid)
+    size_t field_idx = 0;
+    size_t field_start = 0;
+    std::string hcpcs_code;
+    double total_paid = 0.0;
+
+    for (size_t i = 0; i <= line.size(); ++i) {
+        if (i == line.size() || line[i] == ',') {
+            // Process current field if needed
+            if (field_idx == 2) {
+                hcpcs_code = line.substr(field_start, i - field_start);
+            } else if (field_idx == 6) {
+                // Use from_chars for fast double parsing
+                auto result = std::from_chars(line.data() + field_start, line.data() + i, total_paid);
+                if (result.ec != std::errc{}) {
+                    throw std::runtime_error("Invalid total_paid");
+                }
+                return {hcpcs_code, total_paid};  // Early return once we have both fields
+            }
+
+            field_idx++;
+            field_start = i + 1;
+
+            if (field_idx > 6) break;  // Stop after field 6
+        }
     }
-    if (tokens.size() < 7) {
-        throw std::runtime_error("Invalid record: " + line);
-    }
-    ReducedMedicareRecord record;
-    record.hcpcs_code = tokens[2];
-    record.total_paid = std::stod(tokens[6]);
-    return record;
+
+    throw std::runtime_error("Invalid record: insufficient fields");
 }
 
 // Fine-grained inline functions for profiling
