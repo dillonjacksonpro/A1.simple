@@ -242,6 +242,7 @@ struct CommandLineArguments {
     std::string output_path = "output.csv";
     std::string timing_path = "timing.txt";
     unsigned int num_threads = 0;  // 0 means use default (cpus * 2 - 1)
+    size_t chunk_size = 0;  // 0 means use default (64KB)
 };
 
 CommandLineArguments parse_arguments(int argc, char* argv[]) {
@@ -264,6 +265,14 @@ CommandLineArguments parse_arguments(int argc, char* argv[]) {
                 throw std::runtime_error("Invalid --threads value: must be a positive integer");
             }
             args.num_threads = static_cast<unsigned int>(threads_value);
+        } else if ((arg == "--chunk-size" || arg == "-c") && i + 1 < argc) {
+            const char* chunk_str = argv[++i];
+            size_t chunk_value;
+            auto result = std::from_chars(chunk_str, chunk_str + std::strlen(chunk_str), chunk_value);
+            if (result.ec != std::errc{} || chunk_value == 0) {
+                throw std::runtime_error("Invalid --chunk-size value: must be a positive integer");
+            }
+            args.chunk_size = chunk_value;
         } else if (arg == "--help" || arg == "-h") {
             throw std::runtime_error("Help requested");
         } else {
@@ -294,9 +303,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --output, -o <path>        Output CSV file path (default: output.csv)\n";
         std::cerr << "  --timing, -t <path>        Timing report file path (default: timing.txt)\n";
         std::cerr << "  --threads, -n <count>      Number of threads to use (default: cpus * 2 - 1)\n";
+        std::cerr << "  --chunk-size, -c <bytes>   Inner chunk size for prefetching (default: 64KB)\n";
         std::cerr << "  --help, -h                 Show this help message\n";
         std::cerr << "\nExample:\n";
-        std::cerr << "  " << argv[0] << " --input data.csv --output results.csv --threads 8\n";
+        std::cerr << "  " << argv[0] << " --input data.csv --output results.csv --threads 8 --chunk-size 65536\n";
         return 1;
     }
 
@@ -357,25 +367,20 @@ int main(int argc, char* argv[]) {
         }
         ++data_start;  // Move past the '\n'
 
-        // split file into chunks for each thread (line-aligned)
+        // Split file into chunks for each thread (line-aligned)
         size_t data_size = file_size - data_start;
-        size_t chunk_size = data_size / num_threads;
+        size_t thread_chunk_size = data_size / num_threads;
+
+        // Determine inner chunk size for prefetching (default 64KB)
+        size_t inner_chunk_size = (args.chunk_size > 0) ? args.chunk_size : (64 * 1024);
 
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
             g_timer.start("worker_" + std::to_string(i));
 
-            // Calculate byte boundaries
-            size_t start = data_start + (i * chunk_size);
-            size_t end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * chunk_size);
-
-            // Thread-level prefetch: tell kernel to load this chunk (non-blocking)
-            madvise(const_cast<char*>(data_ptr) + start, end - start, MADV_WILLNEED);
-
-            // Align region boundaries to line boundaries
-            align_region_start(data_ptr, start, end, i > 0);
-            size_t line_end = end;
-            align_region_end(data_ptr, line_end, start, i < num_threads - 1);
+            // Calculate thread's byte boundaries
+            size_t thread_start = data_start + (i * thread_chunk_size);
+            size_t thread_end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * thread_chunk_size);
 
             // Process lines in this region with pre-allocated hash table (512 entries)
             std::unordered_map<uint64_t, double> aggregated_data;
@@ -383,7 +388,57 @@ int main(int argc, char* argv[]) {
             std::unordered_map<uint64_t, std::string> local_key_map;
             local_key_map.reserve(512);
 
-            process_region_lines(data_ptr, start, line_end, aggregated_data, local_key_map);
+            // Inner loop: process thread's region in inner chunks with prefetch
+            size_t pos = thread_start;
+            bool is_first_iteration = true;
+
+            while (pos < thread_end) {
+                size_t chunk_end = std::min(pos + inner_chunk_size, thread_end);
+
+                // Align start on first iteration (if not first thread)
+                if (is_first_iteration && i > 0) {
+                    while (pos < chunk_end && data_ptr[pos] != '\n') {
+                        ++pos;
+                    }
+                    if (pos < chunk_end) ++pos;
+                }
+                is_first_iteration = false;
+
+                // Find line boundary for chunk end
+                if (chunk_end < thread_end) {
+                    // Not the last chunk: scan to next line boundary
+                    while (chunk_end < thread_end && data_ptr[chunk_end] != '\n') {
+                        ++chunk_end;
+                    }
+                    if (chunk_end < thread_end) ++chunk_end;  // Move past the '\n'
+                } else {
+                    // Last chunk (chunk_end == thread_end)
+                    if (i < num_threads - 1) {
+                        // Not the last thread: scan backward for line boundary
+                        while (chunk_end > pos && data_ptr[chunk_end - 1] != '\n') {
+                            --chunk_end;
+                        }
+                        // Ensure we have at least something to process
+                        if (chunk_end == pos) {
+                            chunk_end = thread_end;
+                        }
+                    }
+                    // Last thread or after alignment: chunk_end is at thread_end or aligned position
+                }
+
+                // Prefetch NEXT chunk while processing current chunk
+                size_t next_prefetch_start = chunk_end;
+                if (next_prefetch_start < thread_end) {
+                    size_t next_prefetch_end = std::min(next_prefetch_start + inner_chunk_size, thread_end);
+                    madvise(const_cast<char*>(data_ptr) + next_prefetch_start, next_prefetch_end - next_prefetch_start, MADV_WILLNEED);
+                }
+
+                // Process current chunk
+                if (chunk_end > pos) {
+                    process_region_lines(data_ptr, pos, chunk_end, aggregated_data, local_key_map);
+                }
+                pos = chunk_end;
+            }
 
             // Merge results into global aggregation (uint64_t keyed)
             #pragma omp critical

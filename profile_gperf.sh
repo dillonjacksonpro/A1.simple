@@ -9,6 +9,7 @@ INPUT_FILE=""
 OUTPUT_FILE=""
 TIMING_FILE=""
 NUM_THREADS=""
+CHUNK_SIZE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
             NUM_THREADS="$2"
             shift 2
             ;;
+        --chunk-size|-c)
+            CHUNK_SIZE="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 --input <path> [options]"
             echo ""
@@ -38,10 +43,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --output, -o <path>        Output CSV file path (default: output.csv)"
             echo "  --timing, -t <path>        Timing report file path (default: timing.txt)"
             echo "  --threads, -n <count>      Number of threads to use (default: cpus * 2 - 1)"
+            echo "  --chunk-size, -c <bytes>   Inner chunk size for prefetching (default: 64KB)"
             echo "  --help, -h                 Show this help message"
             echo ""
             echo "Example:"
-            echo "  $0 --input data.csv --output results.csv --threads 8"
+            echo "  $0 --input data.csv --output results.csv --threads 8 --chunk-size 65536"
             exit 0
             ;;
         *)
@@ -130,6 +136,7 @@ CMD=("./$PROFILE_BINARY" --input "$INPUT_FILE")
 [ -n "$OUTPUT_FILE" ] && CMD+=(--output "$OUTPUT_FILE")
 [ -n "$TIMING_FILE" ] && CMD+=(--timing "$TIMING_FILE")
 [ -n "$NUM_THREADS" ] && CMD+=(--threads "$NUM_THREADS")
+[ -n "$CHUNK_SIZE" ] && CMD+=(--chunk-size "$CHUNK_SIZE")
 
 echo "Running: ${CMD[@]}"
 if [ "$PERF_AVAILABLE" = true ]; then
