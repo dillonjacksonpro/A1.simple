@@ -427,46 +427,52 @@ int main(int argc, char* argv[]) {
 
     try {
         // Skip header line (first line)
-        size_t data_start = 0;
         const char* data_ptr = static_cast<const char*>(file_data);
-        while (data_start < file_size && data_ptr[data_start] != '\n') {
-            ++data_start;
-        }
-        ++data_start;  // Move past the '\n'
+        const char* header_end = find_newline_simd(data_ptr, data_ptr + file_size);
+        size_t data_start = static_cast<size_t>(header_end - data_ptr) + 1;
 
         // split file into chunks for each thread (line-aligned)
         size_t data_size = file_size - data_start;
         size_t chunk_size = data_size / num_threads;
 
+        // Per-thread maps: each thread owns its slot, no locking needed during parse.
+        std::vector<std::unordered_map<uint64_t, double>> per_thread_data(num_threads);
+        std::vector<std::unordered_map<uint64_t, std::string>> per_thread_keys(num_threads);
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            per_thread_data[i].reserve(512);
+            per_thread_keys[i].reserve(512);
+        }
+
+        // Phase 1: parse — threads write only to their own slot, zero contention.
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
             g_timer.start("worker_" + std::to_string(i));
 
-            // Calculate byte boundaries
             size_t start = data_start + (i * chunk_size);
             size_t end = (i == num_threads - 1) ? file_size : (data_start + (i + 1) * chunk_size);
 
-            // Align region boundaries to line boundaries
             align_region_start(data_ptr, start, end, i > 0);
             size_t line_end = end;
             align_region_end(data_ptr, line_end, start, i < num_threads - 1);
 
-            // Process lines in this region with pre-allocated hash table (512 entries)
-            std::unordered_map<uint64_t, double> aggregated_data;
-            aggregated_data.reserve(512);
-            std::unordered_map<uint64_t, std::string> local_key_map;
-            local_key_map.reserve(512);
-
-            process_region_lines(data_ptr, start, line_end, aggregated_data, local_key_map);
-
-            // Merge results into global aggregation (uint64_t keyed)
-            #pragma omp critical
-            {
-                merge_aggregated_data(aggregated_data_combined, global_key_map, aggregated_data, local_key_map);
-            }
+            process_region_lines(data_ptr, start, line_end, per_thread_data[i], per_thread_keys[i]);
 
             g_timer.stop();
         }
+
+        // Phase 2: tree reduction — halve active threads each round.
+        // O(log N) rounds with N/2 parallel merges each, vs O(N) serialised merges.
+        for (unsigned int stride = 1; stride < num_threads; stride *= 2) {
+            unsigned int limit = num_threads - stride;
+            #pragma omp parallel for num_threads(num_threads)
+            for (unsigned int i = 0; i < limit; i += 2 * stride) {
+                merge_aggregated_data(per_thread_data[i], per_thread_keys[i],
+                                      per_thread_data[i + stride], per_thread_keys[i + stride]);
+            }
+        }
+
+        aggregated_data_combined = std::move(per_thread_data[0]);
+        global_key_map = std::move(per_thread_keys[0]);
     } catch (...) {
         munmap(file_data, file_size);
         close(fd);
@@ -495,10 +501,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "Cannot open output file: " << args.output_path << std::endl;
         return 1;
     }
-    output_file << "hcpcs_code,total_paid" << std::endl;
+    output_file << "hcpcs_code,total_paid\n";
     output_file << std::fixed << std::setprecision(2);
     for (const auto& [hcpcs_code, total_paid] : sorted_data) {
-        output_file << hcpcs_code << "," << total_paid << std::endl;
+        output_file << hcpcs_code << "," << total_paid << "\n";
     }
     output_file.close();
     std::cout << "Aggregation complete. Output written to: " << args.output_path << std::endl;
