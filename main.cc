@@ -176,75 +176,121 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
 }
 #endif
 
-// Single-pass comma extraction: one SIMD scan over the region after the NPI prefix
-// builds a bitmask of all comma positions. ctz extracts the first (hcpcs_end) and
-// clz extracts the last (total_paid_start) in O(1) — no second pass, no second scan.
-//
-// Reads up to 32 bytes past scan_len are safe: mmap pages are zero-padded to 4096-byte
-// boundaries, and we mask out any bits beyond line_end before using the result.
-ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
+struct ParseResult {
+    ReducedMedicareRecord record;
+    const char*           next_line;  // points to char after '\n', or region_end if no '\n'
+};
+
+// Combined scan: finds '\n' (line end) and ',' (field boundaries) in one SIMD pass.
+// Each 32-byte chunk is compared against both delimiters simultaneously, halving the
+// number of loads vs. the previous separate find_newline_simd + parse_medicate_record.
+// Valid Medicare lines never have '\n' in the 22-byte NPI prefix, so scanning from
+// hcpcs_start correctly identifies the line boundary without missing it.
+ParseResult parse_line(const char* line_start, const char* region_end) {
     static constexpr ptrdiff_t hcpcs_offset = 22;  // 10-digit NPI + ',' + 10-digit NPI + ','
-    if (line_end - line_start <= hcpcs_offset) return {nullptr, 0, 0, 0};
-
     const char* hcpcs_start = line_start + hcpcs_offset;
-    const auto  scan_len    = static_cast<unsigned>(line_end - hcpcs_start);
 
-    uint64_t combined = 0;  // bitmask: bit N set ↔ comma at hcpcs_start[N]
+    if (hcpcs_start >= region_end) {
+        const char* nl = find_newline_simd(line_start, region_end);
+        return {{nullptr, 0, 0, 0}, nl < region_end ? nl + 1 : region_end};
+    }
 
 #ifdef __AVX2__
-    const __m256i cm = _mm256_set1_epi8(',');
-    if (scan_len <= 32u) {
-        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start));
-        uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
-        if (scan_len < 32u) mask &= (1u << scan_len) - 1u;
-        combined = mask;
-    } else if (scan_len <= 64u) {
-        __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start));
-        __m256i c2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start + 32));
-        uint32_t m1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, cm)));
-        uint32_t m2 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, cm)));
-        const unsigned rem = scan_len - 32u;
-        if (rem < 32u) m2 &= (1u << rem) - 1u;
-        combined = static_cast<uint64_t>(m1) | (static_cast<uint64_t>(m2) << 32);
+    const __m256i nl_v = _mm256_set1_epi8('\n');
+    const __m256i cm_v = _mm256_set1_epi8(',');
+
+    // Lambda: extract hcpcs and total_paid from a finalised comma bitmask.
+    auto extract = [&](uint64_t comma_mask, const char* line_end) -> ParseResult {
+        if (comma_mask == 0) return {{nullptr, 0, 0, 0}, line_end + 1};
+        const char* hcpcs_end        = hcpcs_start + __builtin_ctzll(comma_mask);
+        const char* total_paid_start = hcpcs_start + (63u - static_cast<unsigned>(__builtin_clzll(comma_mask))) + 1u;
+        if (total_paid_start <= hcpcs_end) return {{nullptr, 0, 0, 0}, line_end + 1};
+        const size_t hlen = static_cast<size_t>(hcpcs_end - hcpcs_start);
+        return {{hcpcs_start, hlen, string_to_key(hcpcs_start, hlen),
+                 parse_cents(total_paid_start, line_end)}, line_end + 1};
+    };
+
+    if (hcpcs_start + 32 <= region_end) {
+        __m256i        c0  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start));
+        const uint32_t nl0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, nl_v)));
+        uint32_t       cm0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, cm_v)));
+
+        if (nl0) {
+            const unsigned p = static_cast<unsigned>(__builtin_ctz(nl0));
+            if (p < 32u) cm0 &= (1u << p) - 1u;
+            return extract(cm0, hcpcs_start + p);
+        }
+
+        if (hcpcs_start + 64 <= region_end) {
+            __m256i        c1  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start + 32));
+            const uint32_t nl1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, nl_v)));
+            uint32_t       cm1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, cm_v)));
+
+            if (nl1) {
+                const unsigned p = static_cast<unsigned>(__builtin_ctz(nl1));
+                if (p < 32u) cm1 &= (1u << p) - 1u;
+                return extract(static_cast<uint64_t>(cm0) | (static_cast<uint64_t>(cm1) << 32),
+                               hcpcs_start + 32 + p);
+            }
+        }
     }
 #else
-    const __m128i cm = _mm_set1_epi8(',');
-    if (scan_len <= 16u) {
-        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start));
-        uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
-        if (scan_len < 16u) mask &= (1u << scan_len) - 1u;
-        combined = mask;
-    } else if (scan_len <= 32u) {
-        __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start));
-        __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start + 16));
-        uint32_t m1 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c1, cm)));
-        uint32_t m2 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c2, cm)));
-        const unsigned rem = scan_len - 16u;
-        if (rem < 16u) m2 &= (1u << rem) - 1u;
-        combined = static_cast<uint64_t>(m1) | (static_cast<uint64_t>(m2) << 16);
+    const __m128i nl_v = _mm_set1_epi8('\n');
+    const __m128i cm_v = _mm_set1_epi8(',');
+
+    auto extract = [&](uint32_t comma_mask, const char* line_end) -> ParseResult {
+        if (comma_mask == 0) return {{nullptr, 0, 0, 0}, line_end + 1};
+        const char* hcpcs_end        = hcpcs_start + __builtin_ctz(comma_mask);
+        const char* total_paid_start = hcpcs_start + (31u - static_cast<unsigned>(__builtin_clz(comma_mask))) + 1u;
+        if (total_paid_start <= hcpcs_end) return {{nullptr, 0, 0, 0}, line_end + 1};
+        const size_t hlen = static_cast<size_t>(hcpcs_end - hcpcs_start);
+        return {{hcpcs_start, hlen, string_to_key(hcpcs_start, hlen),
+                 parse_cents(total_paid_start, line_end)}, line_end + 1};
+    };
+
+    if (hcpcs_start + 16 <= region_end) {
+        __m128i        c0  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start));
+        const uint32_t nl0 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c0, nl_v)));
+        uint32_t       cm0 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c0, cm_v)));
+
+        if (nl0) {
+            const unsigned p = static_cast<unsigned>(__builtin_ctz(nl0));
+            if (p < 16u) cm0 &= (1u << p) - 1u;
+            return extract(cm0, hcpcs_start + p);
+        }
+
+        if (hcpcs_start + 32 <= region_end) {
+            __m128i        c1  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start + 16));
+            const uint32_t nl1 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c1, nl_v)));
+            uint32_t       cm1 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c1, cm_v)));
+
+            if (nl1) {
+                const unsigned p = static_cast<unsigned>(__builtin_ctz(nl1));
+                if (p < 16u) cm1 &= (1u << p) - 1u;
+                return extract(cm0 | (cm1 << 16), hcpcs_start + 16 + p);
+            }
+        }
     }
 #endif
 
-    // Fallback for unusually long lines (scan_len > 64 AVX2 / > 32 SSE2): scalar.
-    if (combined == 0) {
-        const char* hcpcs_end = hcpcs_start;
-        while (hcpcs_end < line_end && *hcpcs_end != ',') ++hcpcs_end;
-        if (hcpcs_end >= line_end) return {nullptr, 0, 0, 0};
-        const char* total_paid_start = line_end;
-        while (*(total_paid_start - 1) != ',') --total_paid_start;
-        if (total_paid_start <= hcpcs_end) return {nullptr, 0, 0, 0};
-        const size_t len = static_cast<size_t>(hcpcs_end - hcpcs_start);
-        return {hcpcs_start, len, string_to_key(hcpcs_start, len),
-                parse_cents(total_paid_start, line_end)};
+    // Slow path: line > 64 bytes from hcpcs_start (AVX2) / > 32 bytes (SSE2), or
+    // no '\n' found in the scan window. Valid lines have no '\n' before byte 22,
+    // so starting at hcpcs_start still finds the correct line boundary.
+    const char* line_end = find_newline_simd(hcpcs_start, region_end);
+    const char* hcpcs_end = hcpcs_start;
+    while (hcpcs_end < line_end && *hcpcs_end != ',') ++hcpcs_end;
+    if (hcpcs_end >= line_end) {
+        return {{nullptr, 0, 0, 0}, line_end < region_end ? line_end + 1 : region_end};
     }
-
-    const char* hcpcs_end        = hcpcs_start + __builtin_ctzll(combined);
-    const char* total_paid_start = hcpcs_start + (63u - static_cast<unsigned>(__builtin_clzll(combined))) + 1u;
-    if (total_paid_start <= hcpcs_end) return {nullptr, 0, 0, 0};
-
-    const size_t hcpcs_len = static_cast<size_t>(hcpcs_end - hcpcs_start);
-    return {hcpcs_start, hcpcs_len, string_to_key(hcpcs_start, hcpcs_len),
-            parse_cents(total_paid_start, line_end)};
+    const char* total_paid_start = line_end;
+    while (*(total_paid_start - 1) != ',') --total_paid_start;
+    if (total_paid_start <= hcpcs_end) {
+        return {{nullptr, 0, 0, 0}, line_end < region_end ? line_end + 1 : region_end};
+    }
+    const size_t hlen = static_cast<size_t>(hcpcs_end - hcpcs_start);
+    return {{hcpcs_start, hlen, string_to_key(hcpcs_start, hlen),
+             parse_cents(total_paid_start, line_end)},
+            line_end < region_end ? line_end + 1 : region_end};
 }
 
 // Reverse SIMD newline search: scans backward from ptr toward base, returns pointer
@@ -304,6 +350,8 @@ inline void align_region_end(const char* data_ptr, size_t& line_end, size_t file
 // Fibonacci hashing (multiply by 2^64/phi) gives uniform bucket distribution.
 // Sentinel: key 0 = empty slot — valid HCPCS keys are never 0 (codes are non-empty strings).
 // Capacity must be a power of 2 and at least 2x the expected number of unique keys.
+// 8192 entries × 16 bytes = 128 KB — fits in L2 cache per core, keeping lookups fast.
+// Supports up to 6144 unique keys (75% load). Increase if the dataset has more unique codes.
 struct FlatDoubleMap {
     struct Entry {
         uint64_t key   = 0;
@@ -313,7 +361,7 @@ struct FlatDoubleMap {
     size_t mask_;
     size_t count_ = 0;
 
-    explicit FlatDoubleMap(size_t capacity = 32768)
+    explicit FlatDoubleMap(size_t capacity = 8192)
         : entries_(capacity), mask_(capacity - 1) {}
 
     void add(uint64_t key, int64_t val) {
@@ -342,18 +390,14 @@ private:
     }
 };
 
-inline void process_region_lines(const char* data_ptr, size_t start, size_t line_end,
+inline void process_region_lines(const char* data_ptr, size_t start, size_t region_end,
                                   FlatDoubleMap& aggregated_data) {
     size_t pos = start;
-    while (pos < line_end) {
-        const char* nl_ptr = find_newline_simd(data_ptr + pos, data_ptr + line_end);
-        size_t next_newline = static_cast<size_t>(nl_ptr - data_ptr);
-
-        ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
-        if (record.hcpcs_ptr == nullptr) { pos = next_newline + 1; continue; }
-        aggregated_data.add(record.hcpcs_key, record.total_cents);
-
-        pos = next_newline + 1;
+    while (pos < region_end) {
+        ParseResult result = parse_line(data_ptr + pos, data_ptr + region_end);
+        if (result.record.hcpcs_ptr != nullptr)
+            aggregated_data.add(result.record.hcpcs_key, result.record.total_cents);
+        pos = static_cast<size_t>(result.next_line - data_ptr);
     }
 }
 
