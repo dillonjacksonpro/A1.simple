@@ -30,24 +30,74 @@ struct MedicareRecord {
 };
 
 struct ReducedMedicareRecord {
-    std::string hcpcs_code;
-    uint64_t hcpcs_key;
-    int64_t total_cents;  // total_paid scaled to integer cents, avoids float parsing and accumulation
+    const char* hcpcs_ptr;  // pointer into mmap'd buffer — no heap allocation
+    size_t      hcpcs_len;
+    uint64_t    hcpcs_key;
+    int64_t     total_cents;
 };
 
-// Parse "NNNNNN.DD" directly to integer cents — replaces std::from_chars<double>.
-// from_chars for floats handles exponents, NaN, inf, denormals; none of that applies
-// to monetary values, so this path is ~5x fewer instructions.
+// Parse monetary string to integer cents without a per-character loop.
+//
+// Fast path (values up to $999,999.99 = 8 digits total):
+//   1. Two memcpy calls compact integer + decimal digits into one 8-byte buffer,
+//      skipping the dot entirely by addressing around it.
+//   2. Masked SWAR subtraction removes ASCII '0' bias from all bytes at once.
+//   3. Left-shift aligns digits so zero-padding is at the low end (required for SWAR).
+//   4. Three rounds of parallel SWAR combine replace the serial *10 loop:
+//        round 1: byte pairs  → 16-bit values  (lo*10 + hi)
+//        round 2: 16-bit pairs → 32-bit values  (*100)
+//        round 3: 32-bit halves → int64          (*10000)
+//   The serial dependency depth drops from O(n digits) to O(log 8) = 3.
 inline int64_t parse_cents(const char* ptr, const char* end) {
-    int64_t cents = 0;
-    while (ptr < end && *ptr != '.') {
-        cents = cents * 10 + static_cast<int64_t>(*ptr - '0');
-        ++ptr;
+    const size_t len = static_cast<size_t>(end - ptr);
+
+    if (len >= 3 && ptr[len - 3] == '.') {
+        const size_t int_len = len - 3;
+        const size_t total   = int_len + 2;  // digit count without the dot
+
+        if (total <= 8) {
+            // Compact digits into an 8-byte zero-initialised buffer:
+            // [integer digits | decimal digits | zero padding]
+            char buf[8] = {};
+            memcpy(buf,           ptr,           int_len);
+            memcpy(buf + int_len, ptr + len - 2, 2);
+
+            uint64_t v = 0;
+            memcpy(&v, buf, 8);
+
+            // Subtract ASCII '0' from each valid digit byte.
+            // Mask prevents borrow propagation from the zero-padded tail bytes.
+            uint64_t digit_sub = 0x3030303030303030ULL;
+            if (total < 8) digit_sub &= (1ULL << (total * 8)) - 1;
+            v -= digit_sub;
+
+            // Left-align: shift zero padding to the low bytes.
+            // SWAR pair-combine requires leading zeros, not trailing zeros.
+            if (total < 8) v <<= static_cast<unsigned>((8 - total) * 8);
+
+            // Round 1: adjacent byte pairs → 16-bit values
+            const uint64_t lo1 = v & 0x00FF00FF00FF00FFULL;
+            const uint64_t hi1 = (v >> 8) & 0x00FF00FF00FF00FFULL;
+            const uint64_t s1  = lo1 * 10 + hi1;
+
+            // Round 2: adjacent 16-bit pairs → 32-bit values
+            const uint64_t lo2 = s1 & 0x0000FFFF0000FFFFULL;
+            const uint64_t hi2 = (s1 >> 16) & 0x0000FFFF0000FFFFULL;
+            const uint64_t s2  = lo2 * 100 + hi2;
+
+            // Round 3: two 32-bit halves → final cents value
+            return static_cast<int64_t>((s2 & 0xFFFFFFFFULL) * 10000 + (s2 >> 32));
+        }
     }
+
+    // Fallback: values larger than $999,999.99 or non-standard decimal placement
+    int64_t cents = 0;
+    while (ptr < end && *ptr != '.')
+        cents = cents * 10 + static_cast<int64_t>(*ptr++ - '0');
     cents *= 100;
     if (ptr < end && *ptr == '.') {
         ++ptr;
-        if (ptr < end) { cents += static_cast<int64_t>(*ptr - '0') * 10; ++ptr; }
+        if (ptr < end) { cents += static_cast<int64_t>(*ptr++ - '0') * 10; }
         if (ptr < end) { cents += static_cast<int64_t>(*ptr - '0'); }
     }
     return cents;
@@ -56,9 +106,9 @@ inline int64_t parse_cents(const char* ptr, const char* end) {
 // Pack up to 8 chars into a uint64_t using little-endian byte order.
 // memcpy into a zero-initialised word compiles to a single mov on x86 for 8-byte inputs.
 // Unique for HCPCS codes since they contain no embedded null bytes.
-inline uint64_t string_to_key(const std::string& s) {
+inline uint64_t string_to_key(const char* s, size_t len) {
     uint64_t key = 0;
-    memcpy(&key, s.data(), std::min(s.size(), size_t(8)));
+    memcpy(&key, s, std::min(len, size_t(8)));
     return key;
 }
 
@@ -127,12 +177,12 @@ ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* 
         ++ptr;
     }
 
-    if (found < 6) return {"", 0, 0};
+    if (found < 6) return {nullptr, 0, 0, 0};
 
     const char* hcpcs_start = commas[1] + 1;
-    std::string hcpcs_code(hcpcs_start, static_cast<size_t>(commas[2] - hcpcs_start));
+    const size_t hcpcs_len  = static_cast<size_t>(commas[2] - hcpcs_start);
 
-    return {hcpcs_code, string_to_key(hcpcs_code), parse_cents(commas[5] + 1, line_end)};
+    return {hcpcs_start, hcpcs_len, string_to_key(hcpcs_start, hcpcs_len), parse_cents(commas[5] + 1, line_end)};
 }
 
 // Reverse SIMD newline search: scans backward from ptr toward base, returns pointer
@@ -175,9 +225,13 @@ inline void align_region_start(const char* data_ptr, size_t& start, size_t end, 
     }
 }
 
-inline void align_region_end(const char* data_ptr, size_t& line_end, size_t start, bool should_align) {
+inline void align_region_end(const char* data_ptr, size_t& line_end, size_t file_size, bool should_align) {
     if (should_align) {
-        const char* nl = find_newline_reverse_simd(data_ptr + start, data_ptr + line_end);
+        // Scan forward from the raw split point to find the next newline.
+        // Both align_region_end (thread i) and align_region_start (thread i+1)
+        // scan forward from the same boundary, so they land on the same newline
+        // with no gap and no double-count.
+        const char* nl = find_newline_simd(data_ptr + line_end, data_ptr + file_size);
         line_end = static_cast<size_t>(nl - data_ptr);
     }
 }
@@ -195,14 +249,21 @@ struct FlatDoubleMap {
     };
     std::vector<Entry> entries_;
     size_t mask_;
+    size_t count_ = 0;
 
-    explicit FlatDoubleMap(size_t capacity = 8192)
+    explicit FlatDoubleMap(size_t capacity = 32768)
         : entries_(capacity), mask_(capacity - 1) {}
 
     void add(uint64_t key, int64_t val) {
+        // Guard: linear probing loops forever if the map is full.
+        // Throw early at 75% load so the caller can see the problem clearly.
+        if (count_ >= (mask_ + 1) * 3 / 4)
+            throw std::overflow_error("FlatDoubleMap exceeded 75% load — increase capacity");
+
         size_t idx = slot(key);
         while (entries_[idx].key != 0 && entries_[idx].key != key)
             idx = (idx + 1) & mask_;
+        if (entries_[idx].key == 0) ++count_;
         entries_[idx].key    = key;
         entries_[idx].value += val;
     }
@@ -228,9 +289,11 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t line
         size_t next_newline = static_cast<size_t>(nl_ptr - data_ptr);
 
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
+        if (record.hcpcs_ptr == nullptr) { pos = next_newline + 1; continue; }
         aggregated_data.add(record.hcpcs_key, record.total_cents);
-        // try_emplace: single lookup, only constructs string value when key is new
-        key_map.try_emplace(record.hcpcs_key, record.hcpcs_code);
+        // try_emplace forwards ptr+len to std::string constructor only when key is new —
+        // no heap allocation for the repeated codes that make up the vast majority of rows
+        key_map.try_emplace(record.hcpcs_key, record.hcpcs_ptr, record.hcpcs_len);
 
         pos = next_newline + 1;
     }
@@ -488,7 +551,7 @@ int main(int argc, char* argv[]) {
 
             align_region_start(data_ptr, start, end, i > 0);
             size_t line_end = end;
-            align_region_end(data_ptr, line_end, start, i < num_threads - 1);
+            align_region_end(data_ptr, line_end, file_size, i < num_threads - 1);
 
             process_region_lines(data_ptr, start, line_end, per_thread_data[i], per_thread_keys[i]);
 
