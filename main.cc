@@ -52,6 +52,14 @@ inline int64_t parse_cents(const char* ptr, const char* end) {
     const size_t len = static_cast<size_t>(end - ptr);
 
     if (len >= 3 && ptr[len - 3] == '.') {
+        // Single 4-byte load catches "0.00" (0x30302E30 LE) in one compare.
+        // Zero payments are common in Medicare data; skipping the SWAR path saves ~10 ops.
+        if (len == 4) {
+            uint32_t word;
+            memcpy(&word, ptr, 4);
+            if (word == 0x30302E30U) return 0;
+        }
+
         const size_t int_len = len - 3;
         const size_t total   = int_len + 2;  // digit count without the dot
 
@@ -67,13 +75,15 @@ inline int64_t parse_cents(const char* ptr, const char* end) {
 
             // Subtract ASCII '0' from each valid digit byte.
             // Mask prevents borrow propagation from the zero-padded tail bytes.
-            uint64_t digit_sub = 0x3030303030303030ULL;
-            if (total < 8) digit_sub &= (1ULL << (total * 8)) - 1;
-            v -= digit_sub;
+            // Branchless: when total==8 the mask is all-ones; ternary compiles to cmov.
+            const uint64_t digit_sub  = 0x3030303030303030ULL;
+            const uint64_t valid_mask = (total < 8u) ? ((1ULL << (total * 8u)) - 1u) : ~0ULL;
+            v -= digit_sub & valid_mask;
 
             // Left-align: shift zero padding to the low bytes.
             // SWAR pair-combine requires leading zeros, not trailing zeros.
-            if (total < 8) v <<= static_cast<unsigned>((8 - total) * 8);
+            // Branchless: shift is 0 when total==8, which is a safe no-op.
+            v <<= static_cast<unsigned>((8u - total) * 8u);
 
             // Round 1: adjacent byte pairs → 16-bit values
             const uint64_t lo1 = v & 0x00FF00FF00FF00FFULL;
@@ -281,8 +291,7 @@ private:
 };
 
 inline void process_region_lines(const char* data_ptr, size_t start, size_t line_end,
-                                  FlatDoubleMap& aggregated_data,
-                                  std::unordered_map<uint64_t, std::string>& key_map) {
+                                  FlatDoubleMap& aggregated_data) {
     size_t pos = start;
     while (pos < line_end) {
         const char* nl_ptr = find_newline_simd(data_ptr + pos, data_ptr + line_end);
@@ -291,22 +300,14 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t line
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
         if (record.hcpcs_ptr == nullptr) { pos = next_newline + 1; continue; }
         aggregated_data.add(record.hcpcs_key, record.total_cents);
-        // try_emplace forwards ptr+len to std::string constructor only when key is new —
-        // no heap allocation for the repeated codes that make up the vast majority of rows
-        key_map.try_emplace(record.hcpcs_key, record.hcpcs_ptr, record.hcpcs_len);
 
         pos = next_newline + 1;
     }
 }
 
-inline void merge_aggregated_data(FlatDoubleMap& global_data,
-                                   std::unordered_map<uint64_t, std::string>& key_to_code,
-                                   const FlatDoubleMap& local_data,
-                                   const std::unordered_map<uint64_t, std::string>& local_key_map) {
+inline void merge_aggregated_data(FlatDoubleMap& global_data, const FlatDoubleMap& local_data) {
     local_data.for_each([&](uint64_t key, int64_t val) {
         global_data.add(key, val);
-        auto it = local_key_map.find(key);
-        if (it != local_key_map.end()) key_to_code.try_emplace(key, it->second);
     });
 }
 
@@ -498,7 +499,6 @@ int main(int argc, char* argv[]) {
     }
 
     FlatDoubleMap aggregated_data_combined;
-    std::unordered_map<uint64_t, std::string> global_key_map;
 
     int fd = open(args.input_path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("Cannot open file");
@@ -536,10 +536,6 @@ int main(int argc, char* argv[]) {
 
         // Per-thread maps: each thread owns its slot, no locking needed during parse.
         std::vector<FlatDoubleMap> per_thread_data(num_threads);
-        std::vector<std::unordered_map<uint64_t, std::string>> per_thread_keys(num_threads);
-        for (unsigned int i = 0; i < num_threads; ++i) {
-            per_thread_keys[i].reserve(512);
-        }
 
         // Phase 1: parse — threads write only to their own slot, zero contention.
         #pragma omp parallel for num_threads(num_threads)
@@ -553,7 +549,7 @@ int main(int argc, char* argv[]) {
             size_t line_end = end;
             align_region_end(data_ptr, line_end, file_size, i < num_threads - 1);
 
-            process_region_lines(data_ptr, start, line_end, per_thread_data[i], per_thread_keys[i]);
+            process_region_lines(data_ptr, start, line_end, per_thread_data[i]);
 
             g_timer.stop();
         }
@@ -564,13 +560,11 @@ int main(int argc, char* argv[]) {
             unsigned int limit = num_threads - stride;
             #pragma omp parallel for num_threads(num_threads)
             for (unsigned int i = 0; i < limit; i += 2 * stride) {
-                merge_aggregated_data(per_thread_data[i], per_thread_keys[i],
-                                      per_thread_data[i + stride], per_thread_keys[i + stride]);
+                merge_aggregated_data(per_thread_data[i], per_thread_data[i + stride]);
             }
         }
 
         aggregated_data_combined = std::move(per_thread_data[0]);
-        global_key_map = std::move(per_thread_keys[0]);
     } catch (...) {
         munmap(file_data, file_size);
         close(fd);
@@ -580,13 +574,13 @@ int main(int argc, char* argv[]) {
     munmap(file_data, file_size);
     close(fd);
 
-    // Convert uint64_t keys back to strings for output
+    // Recover HCPCS string from packed key: string_to_key wrote bytes via memcpy,
+    // so the inverse is another memcpy + strnlen to find the null terminator.
     std::vector<std::pair<std::string, int64_t>> sorted_data;
     aggregated_data_combined.for_each([&](uint64_t key, int64_t total_paid) {
-        auto code_it = global_key_map.find(key);
-        if (code_it != global_key_map.end()) {
-            sorted_data.emplace_back(code_it->second, total_paid);
-        }
+        char code[8];
+        memcpy(code, &key, 8);
+        sorted_data.emplace_back(std::string(code, strnlen(code, 8)), total_paid);
     });
 
     // Sort aggregated data by total_paid (descending) before writing
