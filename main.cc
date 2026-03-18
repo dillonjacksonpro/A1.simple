@@ -122,12 +122,26 @@ inline uint64_t string_to_key(const char* s, size_t len) {
     return key;
 }
 
-// SIMD delimiter search: scan 32 bytes at a time (AVX2) or 16 bytes (SSE2 fallback).
-// Returns pointer to first matching byte, or end if not found.
+// SIMD newline search: process 64 bytes per iteration (AVX2) or 32 bytes (SSE2).
+// Two loads are pipelined in-flight; m1|m2 collapses both results into one branch
+// for the common "not found" case, avoiding a per-chunk misprediction.
+// Returns pointer to first '\n', or end if not found.
 #ifdef __AVX2__
 inline const char* find_newline_simd(const char* ptr, const char* end) {
     const __m256i nl = _mm256_set1_epi8('\n');
-    while (ptr + 32 <= end) {
+    while (ptr + 64 <= end) {
+        __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        __m256i c2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 32));
+        unsigned m1 = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, nl)));
+        unsigned m2 = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, nl)));
+        if (m1 | m2) {
+            if (m1) return ptr + __builtin_ctz(m1);
+            return ptr + 32 + __builtin_ctz(m2);
+        }
+        ptr += 64;
+    }
+    // 32-byte tail for lines that don't fit in a 64-byte aligned chunk
+    if (ptr + 32 <= end) {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
         unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, nl)));
         if (mask != 0) return ptr + __builtin_ctz(mask);
@@ -140,7 +154,18 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
 #else
 inline const char* find_newline_simd(const char* ptr, const char* end) {
     const __m128i nl = _mm_set1_epi8('\n');
-    while (ptr + 16 <= end) {
+    while (ptr + 32 <= end) {
+        __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+        __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr + 16));
+        unsigned m1 = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(c1, nl)));
+        unsigned m2 = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(c2, nl)));
+        if (m1 | m2) {
+            if (m1) return ptr + __builtin_ctz(m1);
+            return ptr + 16 + __builtin_ctz(m2);
+        }
+        ptr += 32;
+    }
+    if (ptr + 16 <= end) {
         __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
         unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, nl)));
         if (mask != 0) return ptr + __builtin_ctz(mask);
@@ -151,48 +176,32 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
 }
 #endif
 
-// Single-pass comma scan: read each chunk once, drain all comma positions from its
-// bitmask before advancing. 6 separate find_comma_simd calls would reload the same
-// chunk repeatedly; this touches each byte at most once.
+// Medicare NPIs are always exactly 10 digits, placing commas[0] and commas[1] at
+// fixed offsets 10 and 21. We only need three of the six commas: commas[1] (hcpcs
+// start), commas[2] (hcpcs end), and commas[5] (total_paid start). Hardcoding the
+// NPI prefix eliminates scanning 22 bytes per line. HCPCS codes (~5 chars) and
+// total_paid (~8 chars) are too short for SIMD to pay off — scalar wins on spans
+// where setup cost exceeds scan cost.
 ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
-    const char* commas[6];
-    int found = 0;
-    const char* ptr = line_start;
+    static constexpr ptrdiff_t hcpcs_offset = 22;  // 10-digit NPI + ',' + 10-digit NPI + ','
+    if (line_end - line_start <= hcpcs_offset) return {nullptr, 0, 0, 0};
 
-#ifdef __AVX2__
-    const __m256i cm = _mm256_set1_epi8(',');
-    while (ptr + 32 <= line_end && found < 6) {
-        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
-        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
-        while (mask != 0 && found < 6) {
-            commas[found++] = ptr + __builtin_ctz(mask);
-            mask &= mask - 1;  // clear lowest set bit, advance to next comma in chunk
-        }
-        ptr += 32;
-    }
-#else
-    const __m128i cm = _mm_set1_epi8(',');
-    while (ptr + 16 <= line_end && found < 6) {
-        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
-        while (mask != 0 && found < 6) {
-            commas[found++] = ptr + __builtin_ctz(mask);
-            mask &= mask - 1;
-        }
-        ptr += 16;
-    }
-#endif
-    while (ptr < line_end && found < 6) {
-        if (*ptr == ',') commas[found++] = ptr;
-        ++ptr;
-    }
+    const char* hcpcs_start = line_start + hcpcs_offset;
 
-    if (found < 6) return {nullptr, 0, 0, 0};
+    // Forward scan for end of HCPCS code — typically 5 iterations.
+    const char* hcpcs_end = hcpcs_start;
+    while (hcpcs_end < line_end && *hcpcs_end != ',') ++hcpcs_end;
+    if (hcpcs_end >= line_end) return {nullptr, 0, 0, 0};
 
-    const char* hcpcs_start = commas[1] + 1;
-    const size_t hcpcs_len  = static_cast<size_t>(commas[2] - hcpcs_start);
+    // Backward scan for start of total_paid — the last field on the line.
+    // hcpcs_end points to a comma so this loop always terminates before crossing it.
+    const char* total_paid_start = line_end;
+    while (*(total_paid_start - 1) != ',') --total_paid_start;
+    if (total_paid_start <= hcpcs_end) return {nullptr, 0, 0, 0};
 
-    return {hcpcs_start, hcpcs_len, string_to_key(hcpcs_start, hcpcs_len), parse_cents(commas[5] + 1, line_end)};
+    const size_t hcpcs_len = static_cast<size_t>(hcpcs_end - hcpcs_start);
+    return {hcpcs_start, hcpcs_len, string_to_key(hcpcs_start, hcpcs_len),
+            parse_cents(total_paid_start, line_end)};
 }
 
 // Reverse SIMD newline search: scans backward from ptr toward base, returns pointer
