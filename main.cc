@@ -59,17 +59,6 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
     return ptr;
 }
 
-inline const char* find_comma_simd(const char* ptr, const char* end) {
-    const __m256i cm = _mm256_set1_epi8(',');
-    while (ptr + 32 <= end) {
-        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
-        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
-        if (mask != 0) return ptr + __builtin_ctz(mask);
-        ptr += 32;
-    }
-    while (ptr < end && *ptr != ',') ++ptr;
-    return ptr;
-}
 #else
 inline const char* find_newline_simd(const char* ptr, const char* end) {
     const __m128i nl = _mm_set1_epi8('\n');
@@ -82,46 +71,52 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
     while (ptr < end && *ptr != '\n') ++ptr;
     return ptr;
 }
-
-inline const char* find_comma_simd(const char* ptr, const char* end) {
-    const __m128i cm = _mm_set1_epi8(',');
-    while (ptr + 16 <= end) {
-        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
-        if (mask != 0) return ptr + __builtin_ctz(mask);
-        ptr += 16;
-    }
-    while (ptr < end && *ptr != ',') ++ptr;
-    return ptr;
-}
 #endif
 
-// Parse record directly from buffer using SIMD comma search to skip fields.
-// Only extracts field 2 (hcpcs_code) and field 6 (total_paid).
+// Single-pass comma scan: read each chunk once, drain all comma positions from its
+// bitmask before advancing. 6 separate find_comma_simd calls would reload the same
+// chunk repeatedly; this touches each byte at most once.
 ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
+    const char* commas[6];
+    int found = 0;
     const char* ptr = line_start;
 
-    // Skip fields 0 and 1
-    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
-    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
-
-    // Field 2: hcpcs_code
-    const char* hcpcs_start = ptr;
-    ptr = find_comma_simd(ptr, line_end);
-    std::string hcpcs_code(hcpcs_start, static_cast<size_t>(ptr - hcpcs_start));
-    if (ptr < line_end) ++ptr;
-
-    // Skip fields 3, 4, 5
-    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
-    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
-    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
-
-    // Field 6: total_paid
-    double total_paid = 0.0;
-    auto result = std::from_chars(ptr, line_end, total_paid);
-    if (result.ec != std::errc{}) {
-        return {hcpcs_code, string_to_key(hcpcs_code), 0.0};
+#ifdef __AVX2__
+    const __m256i cm = _mm256_set1_epi8(',');
+    while (ptr + 32 <= line_end && found < 6) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
+        while (mask != 0 && found < 6) {
+            commas[found++] = ptr + __builtin_ctz(mask);
+            mask &= mask - 1;  // clear lowest set bit, advance to next comma in chunk
+        }
+        ptr += 32;
     }
+#else
+    const __m128i cm = _mm_set1_epi8(',');
+    while (ptr + 16 <= line_end && found < 6) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
+        while (mask != 0 && found < 6) {
+            commas[found++] = ptr + __builtin_ctz(mask);
+            mask &= mask - 1;
+        }
+        ptr += 16;
+    }
+#endif
+    while (ptr < line_end && found < 6) {
+        if (*ptr == ',') commas[found++] = ptr;
+        ++ptr;
+    }
+
+    if (found < 6) return {"", 0, 0.0};
+
+    const char* hcpcs_start = commas[1] + 1;
+    std::string hcpcs_code(hcpcs_start, static_cast<size_t>(commas[2] - hcpcs_start));
+
+    double total_paid = 0.0;
+    std::from_chars(commas[5] + 1, line_end, total_paid);
+
     return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
 }
 
@@ -172,40 +167,65 @@ inline void align_region_end(const char* data_ptr, size_t& line_end, size_t star
     }
 }
 
+// Open-addressing flat hash map: uint64_t key → double value.
+// Contiguous key/value arrays eliminate pointer chasing vs std::unordered_map's chained buckets.
+// Fibonacci hashing (multiply by 2^64/phi) gives uniform bucket distribution.
+// Sentinel: key 0 = empty slot — valid HCPCS keys are never 0 (codes are non-empty strings).
+// Capacity must be a power of 2 and at least 2x the expected number of unique keys.
+struct FlatDoubleMap {
+    std::vector<uint64_t> keys_;
+    std::vector<double>   values_;
+    size_t mask_;
+
+    explicit FlatDoubleMap(size_t capacity = 16384)
+        : keys_(capacity, 0), values_(capacity, 0.0), mask_(capacity - 1) {}
+
+    void add(uint64_t key, double val) {
+        size_t idx = slot(key);
+        while (keys_[idx] != 0 && keys_[idx] != key)
+            idx = (idx + 1) & mask_;
+        keys_[idx] = key;
+        values_[idx] += val;
+    }
+
+    template <typename F>
+    void for_each(F&& fn) const {
+        for (size_t i = 0; i < keys_.size(); ++i)
+            if (keys_[i] != 0) fn(keys_[i], values_[i]);
+    }
+
+private:
+    size_t slot(uint64_t key) const {
+        return (key * 11400714819323198485ULL) & mask_;
+    }
+};
+
 inline void process_region_lines(const char* data_ptr, size_t start, size_t line_end,
-                                  std::unordered_map<uint64_t, double>& aggregated_data,
+                                  FlatDoubleMap& aggregated_data,
                                   std::unordered_map<uint64_t, std::string>& key_map) {
     size_t pos = start;
     while (pos < line_end) {
         const char* nl_ptr = find_newline_simd(data_ptr + pos, data_ptr + line_end);
         size_t next_newline = static_cast<size_t>(nl_ptr - data_ptr);
 
-        // Parse directly from buffer without creating temporary string
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
-        aggregated_data[record.hcpcs_key] += record.total_paid;
-        // Track original string for this key (only store once)
-        if (key_map.find(record.hcpcs_key) == key_map.end()) {
-            key_map[record.hcpcs_key] = record.hcpcs_code;
-        }
+        aggregated_data.add(record.hcpcs_key, record.total_paid);
+        // try_emplace: single lookup, only constructs string value when key is new
+        key_map.try_emplace(record.hcpcs_key, record.hcpcs_code);
 
         pos = next_newline + 1;
     }
 }
 
-inline void merge_aggregated_data(std::unordered_map<uint64_t, double>& global_data,
+inline void merge_aggregated_data(FlatDoubleMap& global_data,
                                    std::unordered_map<uint64_t, std::string>& key_to_code,
-                                   const std::unordered_map<uint64_t, double>& local_data,
+                                   const FlatDoubleMap& local_data,
                                    const std::unordered_map<uint64_t, std::string>& local_key_map) {
-    for (const auto& [key, total_paid] : local_data) {
-        global_data[key] += total_paid;
-        // Store original string mapping if not already present
-        if (key_to_code.find(key) == key_to_code.end()) {
-            auto it = local_key_map.find(key);
-            if (it != local_key_map.end()) {
-                key_to_code[key] = it->second;
-            }
-        }
-    }
+    local_data.for_each([&](uint64_t key, double val) {
+        global_data.add(key, val);
+        auto it = local_key_map.find(key);
+        if (it != local_key_map.end()) key_to_code.try_emplace(key, it->second);
+    });
 }
 
 class TimingTracker {
@@ -395,10 +415,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Number of threads (user-specified): " << num_threads << std::endl;
     }
 
-    // create map to store aggregated data with uint64_t keys for faster hashing
-    // key is hcpcs_code (as uint64_t), value is total paid
-    std::unordered_map<uint64_t, double> aggregated_data_combined;
-    // Global mappings for key -> code (declared outside try block for use after)
+    FlatDoubleMap aggregated_data_combined;
     std::unordered_map<uint64_t, std::string> global_key_map;
 
     int fd = open(args.input_path.c_str(), O_RDONLY);
@@ -436,10 +453,9 @@ int main(int argc, char* argv[]) {
         size_t chunk_size = data_size / num_threads;
 
         // Per-thread maps: each thread owns its slot, no locking needed during parse.
-        std::vector<std::unordered_map<uint64_t, double>> per_thread_data(num_threads);
+        std::vector<FlatDoubleMap> per_thread_data(num_threads);
         std::vector<std::unordered_map<uint64_t, std::string>> per_thread_keys(num_threads);
         for (unsigned int i = 0; i < num_threads; ++i) {
-            per_thread_data[i].reserve(512);
             per_thread_keys[i].reserve(512);
         }
 
@@ -484,12 +500,12 @@ int main(int argc, char* argv[]) {
 
     // Convert uint64_t keys back to strings for output
     std::vector<std::pair<std::string, double>> sorted_data;
-    for (const auto& [key, total_paid] : aggregated_data_combined) {
+    aggregated_data_combined.for_each([&](uint64_t key, double total_paid) {
         auto code_it = global_key_map.find(key);
         if (code_it != global_key_map.end()) {
             sorted_data.emplace_back(code_it->second, total_paid);
         }
-    }
+    });
 
     // Sort aggregated data by total_paid (descending) before writing
     std::sort(sorted_data.begin(), sorted_data.end(),
