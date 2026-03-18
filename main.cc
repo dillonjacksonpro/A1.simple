@@ -32,8 +32,26 @@ struct MedicareRecord {
 struct ReducedMedicareRecord {
     std::string hcpcs_code;
     uint64_t hcpcs_key;
-    double total_paid;
+    int64_t total_cents;  // total_paid scaled to integer cents, avoids float parsing and accumulation
 };
+
+// Parse "NNNNNN.DD" directly to integer cents — replaces std::from_chars<double>.
+// from_chars for floats handles exponents, NaN, inf, denormals; none of that applies
+// to monetary values, so this path is ~5x fewer instructions.
+inline int64_t parse_cents(const char* ptr, const char* end) {
+    int64_t cents = 0;
+    while (ptr < end && *ptr != '.') {
+        cents = cents * 10 + static_cast<int64_t>(*ptr - '0');
+        ++ptr;
+    }
+    cents *= 100;
+    if (ptr < end && *ptr == '.') {
+        ++ptr;
+        if (ptr < end) { cents += static_cast<int64_t>(*ptr - '0') * 10; ++ptr; }
+        if (ptr < end) { cents += static_cast<int64_t>(*ptr - '0'); }
+    }
+    return cents;
+}
 
 // Pack up to 8 chars into a uint64_t using little-endian byte order.
 // memcpy into a zero-initialised word compiles to a single mov on x86 for 8-byte inputs.
@@ -109,15 +127,12 @@ ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* 
         ++ptr;
     }
 
-    if (found < 6) return {"", 0, 0.0};
+    if (found < 6) return {"", 0, 0};
 
     const char* hcpcs_start = commas[1] + 1;
     std::string hcpcs_code(hcpcs_start, static_cast<size_t>(commas[2] - hcpcs_start));
 
-    double total_paid = 0.0;
-    std::from_chars(commas[5] + 1, line_end, total_paid);
-
-    return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
+    return {hcpcs_code, string_to_key(hcpcs_code), parse_cents(commas[5] + 1, line_end)};
 }
 
 // Reverse SIMD newline search: scans backward from ptr toward base, returns pointer
@@ -168,30 +183,34 @@ inline void align_region_end(const char* data_ptr, size_t& line_end, size_t star
 }
 
 // Open-addressing flat hash map: uint64_t key → double value.
-// Contiguous key/value arrays eliminate pointer chasing vs std::unordered_map's chained buckets.
+// Key and value are interleaved in one Entry struct (16 bytes = one cache line slot),
+// so a single cache miss covers both — split arrays would require two misses per lookup.
 // Fibonacci hashing (multiply by 2^64/phi) gives uniform bucket distribution.
 // Sentinel: key 0 = empty slot — valid HCPCS keys are never 0 (codes are non-empty strings).
 // Capacity must be a power of 2 and at least 2x the expected number of unique keys.
 struct FlatDoubleMap {
-    std::vector<uint64_t> keys_;
-    std::vector<double>   values_;
+    struct Entry {
+        uint64_t key   = 0;
+        int64_t  value = 0;
+    };
+    std::vector<Entry> entries_;
     size_t mask_;
 
-    explicit FlatDoubleMap(size_t capacity = 16384)
-        : keys_(capacity, 0), values_(capacity, 0.0), mask_(capacity - 1) {}
+    explicit FlatDoubleMap(size_t capacity = 8192)
+        : entries_(capacity), mask_(capacity - 1) {}
 
-    void add(uint64_t key, double val) {
+    void add(uint64_t key, int64_t val) {
         size_t idx = slot(key);
-        while (keys_[idx] != 0 && keys_[idx] != key)
+        while (entries_[idx].key != 0 && entries_[idx].key != key)
             idx = (idx + 1) & mask_;
-        keys_[idx] = key;
-        values_[idx] += val;
+        entries_[idx].key    = key;
+        entries_[idx].value += val;
     }
 
     template <typename F>
     void for_each(F&& fn) const {
-        for (size_t i = 0; i < keys_.size(); ++i)
-            if (keys_[i] != 0) fn(keys_[i], values_[i]);
+        for (const auto& e : entries_)
+            if (e.key != 0) fn(e.key, e.value);
     }
 
 private:
@@ -209,7 +228,7 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t line
         size_t next_newline = static_cast<size_t>(nl_ptr - data_ptr);
 
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);
-        aggregated_data.add(record.hcpcs_key, record.total_paid);
+        aggregated_data.add(record.hcpcs_key, record.total_cents);
         // try_emplace: single lookup, only constructs string value when key is new
         key_map.try_emplace(record.hcpcs_key, record.hcpcs_code);
 
@@ -221,7 +240,7 @@ inline void merge_aggregated_data(FlatDoubleMap& global_data,
                                    std::unordered_map<uint64_t, std::string>& key_to_code,
                                    const FlatDoubleMap& local_data,
                                    const std::unordered_map<uint64_t, std::string>& local_key_map) {
-    local_data.for_each([&](uint64_t key, double val) {
+    local_data.for_each([&](uint64_t key, int64_t val) {
         global_data.add(key, val);
         auto it = local_key_map.find(key);
         if (it != local_key_map.end()) key_to_code.try_emplace(key, it->second);
@@ -499,8 +518,8 @@ int main(int argc, char* argv[]) {
     close(fd);
 
     // Convert uint64_t keys back to strings for output
-    std::vector<std::pair<std::string, double>> sorted_data;
-    aggregated_data_combined.for_each([&](uint64_t key, double total_paid) {
+    std::vector<std::pair<std::string, int64_t>> sorted_data;
+    aggregated_data_combined.for_each([&](uint64_t key, int64_t total_paid) {
         auto code_it = global_key_map.find(key);
         if (code_it != global_key_map.end()) {
             sorted_data.emplace_back(code_it->second, total_paid);
@@ -518,9 +537,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     output_file << "hcpcs_code,total_paid\n";
-    output_file << std::fixed << std::setprecision(2);
-    for (const auto& [hcpcs_code, total_paid] : sorted_data) {
-        output_file << hcpcs_code << "," << total_paid << "\n";
+    for (const auto& [hcpcs_code, total_cents] : sorted_data) {
+        output_file << hcpcs_code << ","
+                    << total_cents / 100 << "."
+                    << std::setw(2) << std::setfill('0') << total_cents % 100 << "\n";
     }
     output_file.close();
     std::cout << "Aggregation complete. Output written to: " << args.output_path << std::endl;
