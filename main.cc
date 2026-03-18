@@ -176,27 +176,70 @@ inline const char* find_newline_simd(const char* ptr, const char* end) {
 }
 #endif
 
-// Medicare NPIs are always exactly 10 digits, placing commas[0] and commas[1] at
-// fixed offsets 10 and 21. We only need three of the six commas: commas[1] (hcpcs
-// start), commas[2] (hcpcs end), and commas[5] (total_paid start). Hardcoding the
-// NPI prefix eliminates scanning 22 bytes per line. HCPCS codes (~5 chars) and
-// total_paid (~8 chars) are too short for SIMD to pay off — scalar wins on spans
-// where setup cost exceeds scan cost.
+// Single-pass comma extraction: one SIMD scan over the region after the NPI prefix
+// builds a bitmask of all comma positions. ctz extracts the first (hcpcs_end) and
+// clz extracts the last (total_paid_start) in O(1) — no second pass, no second scan.
+//
+// Reads up to 32 bytes past scan_len are safe: mmap pages are zero-padded to 4096-byte
+// boundaries, and we mask out any bits beyond line_end before using the result.
 ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
     static constexpr ptrdiff_t hcpcs_offset = 22;  // 10-digit NPI + ',' + 10-digit NPI + ','
     if (line_end - line_start <= hcpcs_offset) return {nullptr, 0, 0, 0};
 
     const char* hcpcs_start = line_start + hcpcs_offset;
+    const auto  scan_len    = static_cast<unsigned>(line_end - hcpcs_start);
 
-    // Forward scan for end of HCPCS code — typically 5 iterations.
-    const char* hcpcs_end = hcpcs_start;
-    while (hcpcs_end < line_end && *hcpcs_end != ',') ++hcpcs_end;
-    if (hcpcs_end >= line_end) return {nullptr, 0, 0, 0};
+    uint64_t combined = 0;  // bitmask: bit N set ↔ comma at hcpcs_start[N]
 
-    // Backward scan for start of total_paid — the last field on the line.
-    // hcpcs_end points to a comma so this loop always terminates before crossing it.
-    const char* total_paid_start = line_end;
-    while (*(total_paid_start - 1) != ',') --total_paid_start;
+#ifdef __AVX2__
+    const __m256i cm = _mm256_set1_epi8(',');
+    if (scan_len <= 32u) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start));
+        uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
+        if (scan_len < 32u) mask &= (1u << scan_len) - 1u;
+        combined = mask;
+    } else if (scan_len <= 64u) {
+        __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start));
+        __m256i c2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hcpcs_start + 32));
+        uint32_t m1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, cm)));
+        uint32_t m2 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, cm)));
+        const unsigned rem = scan_len - 32u;
+        if (rem < 32u) m2 &= (1u << rem) - 1u;
+        combined = static_cast<uint64_t>(m1) | (static_cast<uint64_t>(m2) << 32);
+    }
+#else
+    const __m128i cm = _mm_set1_epi8(',');
+    if (scan_len <= 16u) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start));
+        uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
+        if (scan_len < 16u) mask &= (1u << scan_len) - 1u;
+        combined = mask;
+    } else if (scan_len <= 32u) {
+        __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start));
+        __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hcpcs_start + 16));
+        uint32_t m1 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c1, cm)));
+        uint32_t m2 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(c2, cm)));
+        const unsigned rem = scan_len - 16u;
+        if (rem < 16u) m2 &= (1u << rem) - 1u;
+        combined = static_cast<uint64_t>(m1) | (static_cast<uint64_t>(m2) << 16);
+    }
+#endif
+
+    // Fallback for unusually long lines (scan_len > 64 AVX2 / > 32 SSE2): scalar.
+    if (combined == 0) {
+        const char* hcpcs_end = hcpcs_start;
+        while (hcpcs_end < line_end && *hcpcs_end != ',') ++hcpcs_end;
+        if (hcpcs_end >= line_end) return {nullptr, 0, 0, 0};
+        const char* total_paid_start = line_end;
+        while (*(total_paid_start - 1) != ',') --total_paid_start;
+        if (total_paid_start <= hcpcs_end) return {nullptr, 0, 0, 0};
+        const size_t len = static_cast<size_t>(hcpcs_end - hcpcs_start);
+        return {hcpcs_start, len, string_to_key(hcpcs_start, len),
+                parse_cents(total_paid_start, line_end)};
+    }
+
+    const char* hcpcs_end        = hcpcs_start + __builtin_ctzll(combined);
+    const char* total_paid_start = hcpcs_start + (63u - static_cast<unsigned>(__builtin_clzll(combined))) + 1u;
     if (total_paid_start <= hcpcs_end) return {nullptr, 0, 0, 0};
 
     const size_t hcpcs_len = static_cast<size_t>(hcpcs_end - hcpcs_start);
