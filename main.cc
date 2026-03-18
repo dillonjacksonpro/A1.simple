@@ -12,6 +12,7 @@
 #include <ctime>
 #include <cstring>
 #include <charconv>
+#include <atomic>
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -344,44 +345,64 @@ inline void align_region_end(const char* data_ptr, size_t& line_end, size_t file
     }
 }
 
-// Open-addressing flat hash map: uint64_t key → double value.
-// Key and value are interleaved in one Entry struct (16 bytes = one cache line slot),
-// so a single cache miss covers both — split arrays would require two misses per lookup.
+// Open-addressing flat hash map: uint64_t key → int64_t value.
+// Lock-free concurrent design: CAS claims an empty slot for a new key; fetch_add
+// accumulates values into an already-claimed slot without any mutex.
+// Key and value are atomic (each 8 bytes = 16 bytes per Entry, one cache-line slot),
+// so a single cache miss covers both key and value.
 // Fibonacci hashing (multiply by 2^64/phi) gives uniform bucket distribution.
 // Sentinel: key 0 = empty slot — valid HCPCS keys are never 0 (codes are non-empty strings).
-// Capacity must be a power of 2 and at least 2x the expected number of unique keys.
-// 8192 entries × 16 bytes = 128 KB — fits in L2 cache per core, keeping lookups fast.
-// Supports up to 6144 unique keys (75% load). Increase if the dataset has more unique codes.
+// Capacity must be a power of 2 and large enough that the 75% load threshold is never hit.
+// 16384 entries × 16 bytes = 256 KB — fits in L2 cache per core on Skylake+.
 struct FlatDoubleMap {
     struct Entry {
-        uint64_t key   = 0;
-        int64_t  value = 0;
+        std::atomic<uint64_t> key{0};
+        std::atomic<int64_t>  value{0};
     };
     std::vector<Entry> entries_;
-    size_t mask_;
-    size_t count_ = 0;
+    size_t             mask_;
+    std::atomic<size_t> count_{0};
 
-    explicit FlatDoubleMap(size_t capacity = 8192)
+    explicit FlatDoubleMap(size_t capacity = 16384)
         : entries_(capacity), mask_(capacity - 1) {}
 
     void add(uint64_t key, int64_t val) {
-        // Guard: linear probing loops forever if the map is full.
-        // Throw early at 75% load so the caller can see the problem clearly.
-        if (count_ >= (mask_ + 1) * 3 / 4)
-            throw std::overflow_error("FlatDoubleMap exceeded 75% load — increase capacity");
-
         size_t idx = slot(key);
-        while (entries_[idx].key != 0 && entries_[idx].key != key)
+        while (true) {
+            uint64_t existing = entries_[idx].key.load(std::memory_order_relaxed);
+            if (existing == key) {
+                // Hot path: key already claimed — just accumulate.
+                entries_[idx].value.fetch_add(val, std::memory_order_relaxed);
+                return;
+            }
+            if (existing == 0) {
+                uint64_t expected = 0;
+                if (entries_[idx].key.compare_exchange_strong(
+                        expected, key,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    // We won the CAS — slot is ours.
+                    if (count_.fetch_add(1, std::memory_order_relaxed) + 1 >= (mask_ + 1) * 3 / 4)
+                        throw std::overflow_error("FlatDoubleMap exceeded 75% load — increase capacity");
+                    entries_[idx].value.fetch_add(val, std::memory_order_relaxed);
+                    return;
+                }
+                // CAS lost — another thread claimed this slot; re-read its key.
+                existing = entries_[idx].key.load(std::memory_order_relaxed);
+                if (existing == key) {
+                    entries_[idx].value.fetch_add(val, std::memory_order_relaxed);
+                    return;
+                }
+            }
             idx = (idx + 1) & mask_;
-        if (entries_[idx].key == 0) ++count_;
-        entries_[idx].key    = key;
-        entries_[idx].value += val;
+        }
     }
 
     template <typename F>
     void for_each(F&& fn) const {
-        for (const auto& e : entries_)
-            if (e.key != 0) fn(e.key, e.value);
+        for (const auto& e : entries_) {
+            uint64_t k = e.key.load(std::memory_order_relaxed);
+            if (k != 0) fn(k, e.value.load(std::memory_order_relaxed));
+        }
     }
 
 private:
@@ -401,11 +422,6 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t regi
     }
 }
 
-inline void merge_aggregated_data(FlatDoubleMap& global_data, const FlatDoubleMap& local_data) {
-    local_data.for_each([&](uint64_t key, int64_t val) {
-        global_data.add(key, val);
-    });
-}
 
 class TimingTracker {
     struct ThreadTiming {
@@ -630,10 +646,8 @@ int main(int argc, char* argv[]) {
         size_t data_size = file_size - data_start;
         size_t chunk_size = data_size / num_threads;
 
-        // Per-thread maps: each thread owns its slot, no locking needed during parse.
-        std::vector<FlatDoubleMap> per_thread_data(num_threads);
-
-        // Phase 1: parse — threads write only to their own slot, zero contention.
+        // All threads share one map — CAS claims slots, fetch_add accumulates values.
+        // Eliminates the per-thread allocation and O(log N) tree-reduction merge phase.
         #pragma omp parallel for num_threads(num_threads)
         for (unsigned int i = 0; i < num_threads; ++i) {
             g_timer.start("worker_" + std::to_string(i));
@@ -645,22 +659,10 @@ int main(int argc, char* argv[]) {
             size_t line_end = end;
             align_region_end(data_ptr, line_end, file_size, i < num_threads - 1);
 
-            process_region_lines(data_ptr, start, line_end, per_thread_data[i]);
+            process_region_lines(data_ptr, start, line_end, aggregated_data_combined);
 
             g_timer.stop();
         }
-
-        // Phase 2: tree reduction — halve active threads each round.
-        // O(log N) rounds with N/2 parallel merges each, vs O(N) serialised merges.
-        for (unsigned int stride = 1; stride < num_threads; stride *= 2) {
-            unsigned int limit = num_threads - stride;
-            #pragma omp parallel for num_threads(num_threads)
-            for (unsigned int i = 0; i < limit; i += 2 * stride) {
-                merge_aggregated_data(per_thread_data[i], per_thread_data[i + stride]);
-            }
-        }
-
-        aggregated_data_combined = std::move(per_thread_data[0]);
     } catch (...) {
         munmap(file_data, file_size);
         close(fd);
