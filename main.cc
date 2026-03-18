@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <immintrin.h>
 
 struct MedicareRecord {
     std::string billing_provider_npi;
@@ -34,62 +35,140 @@ struct ReducedMedicareRecord {
     double total_paid;
 };
 
-// Convert string (≤8 chars) to uint64_t for hashing
+// Pack up to 8 chars into a uint64_t using little-endian byte order.
+// memcpy into a zero-initialised word compiles to a single mov on x86 for 8-byte inputs.
+// Unique for HCPCS codes since they contain no embedded null bytes.
 inline uint64_t string_to_key(const std::string& s) {
     uint64_t key = 0;
-    for (size_t i = 0; i < std::min(s.size(), size_t(8)); ++i) {
-        key = (key << 8) | static_cast<uint8_t>(s[i]);
-    }
+    memcpy(&key, s.data(), std::min(s.size(), size_t(8)));
     return key;
 }
 
-// Parse record directly from buffer to avoid string allocation
-ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
-    // Manual CSV parsing: only extract fields 2 (hcpcs_code) and 6 (total_paid)
-    size_t field_idx = 0;
-    const char* field_start = line_start;
-    std::string hcpcs_code;
-    double total_paid = 0.0;
-
-    for (const char* i = line_start; i <= line_end; ++i) {
-        if (i == line_end || *i == ',') {
-            // Process current field if needed
-            if (field_idx == 2) {
-                hcpcs_code.assign(field_start, static_cast<size_t>(i - field_start));
-            } else if (field_idx == 6) {
-                // Use from_chars for fast double parsing
-                auto result = std::from_chars(field_start, i, total_paid);
-                if (result.ec != std::errc{}) {
-                    return {hcpcs_code, string_to_key(hcpcs_code), 0.0};
-                }
-                return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
-            }
-
-            field_idx++;
-            field_start = i + 1;
-
-            if (field_idx > 6) break;  // Stop after field 6
-        }
+// SIMD delimiter search: scan 32 bytes at a time (AVX2) or 16 bytes (SSE2 fallback).
+// Returns pointer to first matching byte, or end if not found.
+#ifdef __AVX2__
+inline const char* find_newline_simd(const char* ptr, const char* end) {
+    const __m256i nl = _mm256_set1_epi8('\n');
+    while (ptr + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, nl)));
+        if (mask != 0) return ptr + __builtin_ctz(mask);
+        ptr += 32;
     }
+    while (ptr < end && *ptr != '\n') ++ptr;
+    return ptr;
+}
 
+inline const char* find_comma_simd(const char* ptr, const char* end) {
+    const __m256i cm = _mm256_set1_epi8(',');
+    while (ptr + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, cm)));
+        if (mask != 0) return ptr + __builtin_ctz(mask);
+        ptr += 32;
+    }
+    while (ptr < end && *ptr != ',') ++ptr;
+    return ptr;
+}
+#else
+inline const char* find_newline_simd(const char* ptr, const char* end) {
+    const __m128i nl = _mm_set1_epi8('\n');
+    while (ptr + 16 <= end) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, nl)));
+        if (mask != 0) return ptr + __builtin_ctz(mask);
+        ptr += 16;
+    }
+    while (ptr < end && *ptr != '\n') ++ptr;
+    return ptr;
+}
+
+inline const char* find_comma_simd(const char* ptr, const char* end) {
+    const __m128i cm = _mm_set1_epi8(',');
+    while (ptr + 16 <= end) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, cm)));
+        if (mask != 0) return ptr + __builtin_ctz(mask);
+        ptr += 16;
+    }
+    while (ptr < end && *ptr != ',') ++ptr;
+    return ptr;
+}
+#endif
+
+// Parse record directly from buffer using SIMD comma search to skip fields.
+// Only extracts field 2 (hcpcs_code) and field 6 (total_paid).
+ReducedMedicareRecord parse_medicate_record(const char* line_start, const char* line_end) {
+    const char* ptr = line_start;
+
+    // Skip fields 0 and 1
+    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
+    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
+
+    // Field 2: hcpcs_code
+    const char* hcpcs_start = ptr;
+    ptr = find_comma_simd(ptr, line_end);
+    std::string hcpcs_code(hcpcs_start, static_cast<size_t>(ptr - hcpcs_start));
+    if (ptr < line_end) ++ptr;
+
+    // Skip fields 3, 4, 5
+    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
+    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
+    ptr = find_comma_simd(ptr, line_end); if (ptr < line_end) ++ptr;
+
+    // Field 6: total_paid
+    double total_paid = 0.0;
+    auto result = std::from_chars(ptr, line_end, total_paid);
+    if (result.ec != std::errc{}) {
+        return {hcpcs_code, string_to_key(hcpcs_code), 0.0};
+    }
     return {hcpcs_code, string_to_key(hcpcs_code), total_paid};
 }
 
-// Fine-grained inline functions for profiling
+// Reverse SIMD newline search: scans backward from ptr toward base, returns pointer
+// to the newline, or base if not found.
+#ifdef __AVX2__
+inline const char* find_newline_reverse_simd(const char* base, const char* ptr) {
+    const __m256i nl = _mm256_set1_epi8('\n');
+    while (ptr - 32 >= base) {
+        ptr -= 32;
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, nl)));
+        if (mask != 0) {
+            // __builtin_clz finds highest set bit; highest bit = rightmost byte in memory
+            return ptr + (31 - __builtin_clz(mask));
+        }
+    }
+    while (ptr > base && *(ptr - 1) != '\n') --ptr;
+    return ptr;
+}
+#else
+inline const char* find_newline_reverse_simd(const char* base, const char* ptr) {
+    const __m128i nl = _mm_set1_epi8('\n');
+    while (ptr - 16 >= base) {
+        ptr -= 16;
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, nl)));
+        if (mask != 0) {
+            return ptr + (15 - __builtin_clz(mask << 16));
+        }
+    }
+    while (ptr > base && *(ptr - 1) != '\n') --ptr;
+    return ptr;
+}
+#endif
+
 inline void align_region_start(const char* data_ptr, size_t& start, size_t end, bool should_align) {
     if (should_align) {
-        while (start < end && data_ptr[start] != '\n') {
-            ++start;
-        }
-        ++start;
+        const char* nl = find_newline_simd(data_ptr + start, data_ptr + end);
+        start = static_cast<size_t>(nl - data_ptr) + 1;
     }
 }
 
 inline void align_region_end(const char* data_ptr, size_t& line_end, size_t start, bool should_align) {
     if (should_align) {
-        while (line_end > start && data_ptr[line_end - 1] != '\n') {
-            --line_end;
-        }
+        const char* nl = find_newline_reverse_simd(data_ptr + start, data_ptr + line_end);
+        line_end = static_cast<size_t>(nl - data_ptr);
     }
 }
 
@@ -98,10 +177,8 @@ inline void process_region_lines(const char* data_ptr, size_t start, size_t line
                                   std::unordered_map<uint64_t, std::string>& key_map) {
     size_t pos = start;
     while (pos < line_end) {
-        size_t next_newline = pos;
-        while (next_newline < line_end && data_ptr[next_newline] != '\n') {
-            ++next_newline;
-        }
+        const char* nl_ptr = find_newline_simd(data_ptr + pos, data_ptr + line_end);
+        size_t next_newline = static_cast<size_t>(nl_ptr - data_ptr);
 
         // Parse directly from buffer without creating temporary string
         ReducedMedicareRecord record = parse_medicate_record(data_ptr + pos, data_ptr + next_newline);

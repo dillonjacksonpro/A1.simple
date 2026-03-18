@@ -11,10 +11,12 @@ echo "Building main with conservative optimizations..."
 # Conservative optimization flags:
 # -O2: Good balance of speed and compile time, safer than O3
 # -g0: Strip debug symbols for smaller binary
+# -mavx2: Enable AVX2 SIMD (32-byte vectors); remove for non-AVX2 targets (falls back to SSE2)
 g++ \
     -std=c++17 \
     -O2 \
     -g0 \
+    -mavx2 \
     -Wall -Wextra -Wpedantic \
     -Wshadow -Wconversion -Wsign-conversion \
     -Wnull-dereference -Wdouble-promotion -Wformat=2 \

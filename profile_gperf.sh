@@ -93,11 +93,13 @@ echo "Compiling with gperftools..."
 
 # Compile for profiling with gperftools
 # -g: Debug symbols (needed for pprof to map addresses to functions)
+# -mavx2: Must match build_release.sh so the AVX2 SIMD paths are profiled, not the SSE2 fallback
 # -lprofiler: Link against gperftools profiler library
 g++ \
     -std=c++17 \
     -O2 \
     -g \
+    -mavx2 \
     -Wall -Wextra -Wpedantic \
     -Wshadow -Wconversion -Wsign-conversion \
     -Wnull-dereference -Wdouble-promotion -Wformat=2 \
@@ -134,6 +136,16 @@ CMD=("./$PROFILE_BINARY" --input "$INPUT_FILE")
 echo "Running: ${CMD[@]}"
 if [ "$PERF_AVAILABLE" = true ]; then
     echo ""
+    perf stat \
+        -e page-faults,minor-faults,major-faults \
+        -e L1-dcache-loads,L1-dcache-load-misses \
+        -e LLC-loads,LLC-load-misses \
+        -e dTLB-loads,dTLB-load-misses \
+        -e branch-instructions,branch-misses \
+        -e cycles,instructions \
+        -e fp_arith_inst_retired.256b_packed_double,fp_arith_inst_retired.128b_packed_double \
+        -o "$PERF_REPORT" \
+        "${CMD[@]}" 2>/dev/null || \
     perf stat \
         -e page-faults,minor-faults,major-faults \
         -e L1-dcache-loads,L1-dcache-load-misses \
@@ -178,6 +190,8 @@ if [ "$PERF_AVAILABLE" = true ] && [ -f "$PERF_REPORT" ]; then
     BRANCH_INSTRUCTIONS=$(grep " branch-instructions" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
     INSTRUCTIONS=$(grep " instructions" "$PERF_REPORT" | tail -1 | awk '{print $1}' | tr -d ',')
     CYCLES=$(grep " cycles" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    AVX256=$(grep "256b_packed_double" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
+    AVX128=$(grep "128b_packed_double" "$PERF_REPORT" | head -1 | awk '{print $1}' | tr -d ',')
 
     [ -n "$PAGE_FAULTS" ] && echo "Total page faults:       $PAGE_FAULTS"
     [ -n "$MAJOR_FAULTS" ] && echo "Major page faults (I/O): $MAJOR_FAULTS"
@@ -201,6 +215,21 @@ if [ "$PERF_AVAILABLE" = true ] && [ -f "$PERF_REPORT" ]; then
     if [ -n "$INSTRUCTIONS" ] && [ "$CYCLES" -gt 0 ]; then
         IPC=$(awk "BEGIN {printf \"%.3f\", $INSTRUCTIONS / $CYCLES}")
         echo "Instructions per cycle:  $IPC"
+    fi
+
+    # SIMD vector throughput (only present when fp_arith_inst_retired events are supported)
+    if [ -n "$AVX256" ] || [ -n "$AVX128" ]; then
+        echo ""
+        echo "--- SIMD Vector Throughput ---"
+        [ -n "$AVX256" ] && echo "AVX2 256-bit FP ops:     $AVX256"
+        [ -n "$AVX128" ] && echo "SSE  128-bit FP ops:     $AVX128"
+        if [ -n "$AVX256" ] && [ -n "$AVX128" ] && \
+           [ "$AVX256" -gt 0 ] || [ "$AVX128" -gt 0 ] 2>/dev/null; then
+            TOTAL_VEC=$(awk "BEGIN {print ${AVX256:-0} + ${AVX128:-0}}")
+            AVX_PCT=$(awk "BEGIN {t=${AVX256:-0}+${AVX128:-0}; if(t>0) printf \"%.1f\", (${AVX256:-0}/t)*100; else print \"0.0\"}")
+            echo "Total vector ops:        $TOTAL_VEC"
+            echo "AVX2 share:              $AVX_PCT%  (higher = SIMD paths active)"
+        fi
     fi
     echo ""
 fi
